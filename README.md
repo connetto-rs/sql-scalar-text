@@ -2,9 +2,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/sql-scalar-text.svg)](https://crates.io/crates/sql-scalar-text)
 [![docs.rs](https://img.shields.io/docsrs/sql-scalar-text)](https://docs.rs/sql-scalar-text)
-[![CI](https://github.com/LucaCappelletti94/sql-scalar-text/actions/workflows/ci.yml/badge.svg)](https://github.com/LucaCappelletti94/sql-scalar-text/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/LucaCappelletti94/sql-scalar-text)
-[![license](https://img.shields.io/crates/l/sql-scalar-text.svg)](https://github.com/LucaCappelletti94/sql-scalar-text/blob/main/LICENSE)
+[![CI](https://github.com/connetto-rs/sql-scalar-text/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/sql-scalar-text/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/connetto-rs/sql-scalar-text)
+[![license](https://img.shields.io/crates/l/sql-scalar-text.svg)](https://github.com/connetto-rs/sql-scalar-text/blob/main/LICENSE)
 
 `sql-scalar-text` parses the text forms that PostgreSQL, MySQL, and SQLite emit for scalar values. Its shared acceptance set lets every wire-text consumer decode the same spelling to the same Rust value.
 
