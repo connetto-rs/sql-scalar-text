@@ -2,6 +2,8 @@
 mod containers;
 #[path = "support/exit_slot.rs"]
 mod exit_slot;
+#[path = "support/fractional_matrix.rs"]
+mod fractional_matrix;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use diesel::prelude::*;
@@ -88,16 +90,7 @@ fn pg_timestamp_fractional_precision_matrix() {
         ),
     ];
 
-    for &(expr, frac_ns) in cases {
-        let text = pg_text(&mut conn, expr);
-        let expected = NaiveDate::from_ymd_opt(2024, 1, 15)
-            .unwrap()
-            .and_hms_nano_opt(10, 30, 45, frac_ns)
-            .unwrap();
-        let got = parse_timestamp(&text)
-            .unwrap_or_else(|| panic!("parse_timestamp: {text:?} (expr={expr})"));
-        assert_eq!(got, expected, "expr={expr} text={text:?}");
-    }
+    fractional_matrix::assert_fractional_seconds(cases, |expr| pg_text(&mut conn, expr));
 }
 
 #[test]
