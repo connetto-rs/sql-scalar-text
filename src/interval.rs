@@ -157,7 +157,7 @@ impl fmt::Display for PgInterval {
             let mut fraction = magnitude % USECS_PER_SEC;
             if fraction != 0 {
                 let mut digits = 6;
-                while fraction % 10 == 0 {
+                while fraction.is_multiple_of(10) {
                     fraction /= 10;
                     digits -= 1;
                 }
