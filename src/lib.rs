@@ -3,6 +3,12 @@
 
 extern crate alloc;
 
+mod interval;
+
+pub use interval::{
+    IntervalFields, IntervalTypmod, PgInterval, parse_interval, parse_interval_typmod,
+};
+
 use alloc::vec::Vec;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 

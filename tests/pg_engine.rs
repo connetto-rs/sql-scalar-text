@@ -4,6 +4,8 @@ mod containers;
 mod exit_slot;
 #[path = "support/fractional_matrix.rs"]
 mod fractional_matrix;
+#[path = "support/postgres.rs"]
+mod postgres;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use diesel::prelude::*;
@@ -12,45 +14,13 @@ use sql_scalar_text::{
     parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex, parse_time, parse_timestamp,
     parse_timestamp_tz,
 };
-use testcontainers::{
-    GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::SyncRunner,
-};
 
 /// One container per test binary, removed when the binary exits; a plain
 /// `static` would keep it running forever, see `exit_slot`.
-static PG: exit_slot::ExitSlot<testcontainers::Container<GenericImage>> =
-    exit_slot::ExitSlot::new();
-
-fn pg_port() -> u16 {
-    PG.with(
-        || {
-            containers::sweep_abandoned();
-            GenericImage::new("postgres", "16.15-alpine")
-                .with_exposed_port(5432.tcp())
-                .with_wait_for(WaitFor::message_on_stderr(
-                    "database system is ready to accept connections",
-                ))
-                .with_env_var("POSTGRES_PASSWORD", "postgres")
-                .with_env_var("POSTGRES_USER", "postgres")
-                .with_env_var("POSTGRES_DB", "postgres")
-                .with_labels(containers::labels("postgres"))
-                .start()
-                .expect("start postgres 16.15-alpine")
-        },
-        |container| {
-            container
-                .get_host_port_ipv4(5432)
-                .expect("get postgres port")
-        },
-    )
-}
+static PG: postgres::Slot = exit_slot::ExitSlot::new();
 
 fn pg_conn() -> PgConnection {
-    let port = pg_port();
-    let url = format!("host=127.0.0.1 port={port} user=postgres password=postgres dbname=postgres");
-    PgConnection::establish(&url).expect("connect to postgres")
+    postgres::connect(&PG, "16.15-alpine")
 }
 
 // Raw SQL: vendor cast syntax cannot be expressed in the Diesel DSL.

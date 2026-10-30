@@ -1,8 +1,8 @@
 use core::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use sql_scalar_text::{
-    parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex, parse_time, parse_timestamp,
-    parse_timestamp_tz,
+    parse_bool, parse_date, parse_f64, parse_i64, parse_interval, parse_pg_bytea_hex, parse_time,
+    parse_timestamp, parse_timestamp_tz,
 };
 
 #[cfg(feature = "decimal")]
@@ -66,6 +66,17 @@ fn f64_corpus() -> Vec<&'static str> {
         "3.141592653589793",
         "Infinity",
         "-Infinity",
+    ]
+}
+
+fn interval_corpus() -> Vec<&'static str> {
+    vec![
+        "00:15:00",
+        "1 day",
+        "1 year 2 mons 3 days 04:05:06.789",
+        "-1 days +02:00:00",
+        "@ 1 hour ago",
+        "PT15M",
     ]
 }
 
@@ -162,6 +173,17 @@ fn bench_parse_f64(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_parse_interval(c: &mut Criterion) {
+    let corpus = interval_corpus();
+    let mut group = c.benchmark_group("parse_interval");
+    for &input in &corpus {
+        group.bench_with_input(BenchmarkId::from_parameter(input), &input, |b, text| {
+            b.iter(|| black_box(parse_interval(black_box(*text))))
+        });
+    }
+    group.finish();
+}
+
 #[cfg(feature = "decimal")]
 fn bench_parse_decimal(c: &mut Criterion) {
     let corpus = decimal_corpus();
@@ -185,6 +207,7 @@ criterion_group!(
     bench_parse_pg_bytea_hex,
     bench_parse_i64,
     bench_parse_f64,
+    bench_parse_interval,
     bench_parse_decimal,
 );
 
@@ -199,6 +222,7 @@ criterion_group!(
     bench_parse_pg_bytea_hex,
     bench_parse_i64,
     bench_parse_f64,
+    bench_parse_interval,
 );
 
 criterion_main!(benches);

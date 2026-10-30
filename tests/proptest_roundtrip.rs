@@ -2,9 +2,10 @@ use chrono::{Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZon
 use core::fmt::Write as _;
 use proptest::prelude::*;
 use sql_scalar_text::{
-    parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex, parse_time, parse_timestamp,
-    parse_timestamp_tz,
+    PgInterval, parse_bool, parse_date, parse_f64, parse_i64, parse_interval, parse_pg_bytea_hex,
+    parse_time, parse_timestamp, parse_timestamp_tz,
 };
+use std::hash::BuildHasher as _;
 
 fn date_strategy() -> impl Strategy<Value = NaiveDate> {
     (1970i32..=2100, 1u32..=366u32).prop_filter_map("valid calendar date", |(year, doy)| {
@@ -340,5 +341,53 @@ fn decimal_corpus_idempotence() {
         let text = v.to_string();
         let w = parse_decimal(&text).unwrap_or_else(|| panic!("second parse: {text:?}"));
         assert_eq!(v, w, "idempotence: {s:?}");
+    }
+}
+
+fn interval_strategy() -> impl Strategy<Value = PgInterval> {
+    let months = prop_oneof![any::<i32>(), -30i32..30];
+    let days = prop_oneof![any::<i32>(), -40i32..40];
+    let microseconds = prop_oneof![any::<i64>(), -200_000_000_000i64..200_000_000_000];
+    (months, days, microseconds).prop_map(|(months, days, microseconds)| PgInterval {
+        months,
+        days,
+        microseconds,
+    })
+}
+
+proptest! {
+    #[test]
+    fn interval_postgres_text_roundtrip(interval in interval_strategy()) {
+        // PostgreSQL cannot read back the clock it prints for this count.
+        prop_assume!(!interval.is_finite() || interval.microseconds != i64::MIN);
+        let text = interval.to_string();
+        let got = parse_interval(&text)
+            .unwrap_or_else(|| panic!("parse_interval: {text:?}"));
+        prop_assert_eq!(
+            (got.months, got.days, got.microseconds),
+            (interval.months, interval.days, interval.microseconds),
+            "{}",
+            text
+        );
+    }
+
+    #[test]
+    fn interval_month_as_thirty_days_is_equal_and_hashes_equal(interval in interval_strategy()) {
+        let Some(days) = interval.days.checked_add(30) else { return Ok(()) };
+        let Some(months) = interval.months.checked_sub(1) else { return Ok(()) };
+        let shifted = PgInterval { months, days, ..interval };
+        let hasher = std::hash::RandomState::new();
+        prop_assert_eq!(interval, shifted);
+        prop_assert_eq!(hasher.hash_one(interval), hasher.hash_one(shifted));
+    }
+
+    #[test]
+    fn interval_day_as_twenty_four_hours_is_equal_and_hashes_equal(interval in interval_strategy()) {
+        let Some(microseconds) = interval.microseconds.checked_add(86_400_000_000) else { return Ok(()) };
+        let Some(days) = interval.days.checked_sub(1) else { return Ok(()) };
+        let shifted = PgInterval { days, microseconds, ..interval };
+        let hasher = std::hash::RandomState::new();
+        prop_assert_eq!(interval, shifted);
+        prop_assert_eq!(hasher.hash_one(interval), hasher.hash_one(shifted));
     }
 }
