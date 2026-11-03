@@ -1,11 +1,11 @@
 [package]
 name = "sql-scalar-text"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Luca Cappelletti"]
 license = "MIT"
-description = "Parse SQL scalar text from PostgreSQL, MySQL, and SQLite"
+description = "SQL values, with PostgreSQL's value rules beside readers of the text PostgreSQL, MySQL and SQLite emit"
 repository = "https://github.com/connetto-rs/sql-scalar-text"
 readme = "README.md"
 keywords = ["sql", "parser", "postgresql", "mysql", "sqlite"]
@@ -17,10 +17,13 @@ all-features = true
 [features]
 default = []
 decimal = ["dep:bigdecimal"]
+serde = ["dep:serde"]
 
 [dependencies]
 bigdecimal = { version = "0.4", default-features = false, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
