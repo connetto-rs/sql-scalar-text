@@ -1,7 +1,9 @@
-//! PostgreSQL `interval` values read by `interval_in`, printed by `interval_out` and compared by
-//! `interval_cmp`.
+//! PostgreSQL `interval` values read by `interval_in`, printed by `interval_out`, compared by
+//! `interval_cmp` and combined by PostgreSQL's interval arithmetic.
 
+mod arithmetic;
 mod decode;
+mod float;
 
 use core::{
     cmp::Ordering,
@@ -9,6 +11,7 @@ use core::{
     hash::{Hash, Hasher},
 };
 
+pub use arithmetic::{IntervalSum, ShiftError};
 use decode::{
     INTERVAL_FULL_RANGE, RANGE_DAY, RANGE_HOUR, RANGE_MINUTE, RANGE_MONTH, RANGE_SECOND,
     RANGE_YEAR, interval_in,
@@ -32,6 +35,7 @@ const DAYS_PER_MONTH: i64 = 30;
 /// assert_eq!(PgInterval::NEG_INFINITY.to_string(), "-infinity");
 /// ```
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PgInterval {
     /// Months, twelve of which print as a year.
     pub months: i32,
@@ -75,16 +79,43 @@ impl PgInterval {
             && self.microseconds == other.microseconds
     }
 
-    /// `interval_cmp_value`, the span in microseconds.
-    fn span(&self) -> i128 {
+    /// PostgreSQL's `interval_cmp_value`, the span in microseconds with a month as 30 days and a
+    /// day as 24 hours, which orders, equates and hashes the interval.
+    ///
+    /// ```
+    /// use sql_scalar_text::parse_interval;
+    ///
+    /// let month = parse_interval("1 mon -1 days").unwrap();
+    /// assert_eq!(month.span_microseconds(), 29 * 86_400_000_000);
+    /// ```
+    #[must_use]
+    pub fn span_microseconds(&self) -> i128 {
         let days = i64::from(self.months) * DAYS_PER_MONTH + i64::from(self.days);
         i128::from(self.microseconds) + i128::from(days) * USECS_PER_DAY
     }
 }
 
+/// Why PostgreSQL refuses to read an interval or to compute one, one variant per message it
+/// raises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum IntervalError {
+    /// Text `interval_in` cannot read.
+    #[error("invalid input syntax for type interval")]
+    InvalidSyntax,
+    /// A number of the text beyond the integer its field accumulates in.
+    #[error("interval field value out of range")]
+    FieldValueOutOfRange,
+    /// A value beyond the type, or arithmetic PostgreSQL has no answer for.
+    #[error("interval out of range")]
+    OutOfRange,
+    /// An interval divided by zero.
+    #[error("division by zero")]
+    DivisionByZero,
+}
+
 impl PartialEq for PgInterval {
     fn eq(&self, other: &Self) -> bool {
-        self.span() == other.span()
+        self.span_microseconds() == other.span_microseconds()
     }
 }
 
@@ -98,13 +129,13 @@ impl PartialOrd for PgInterval {
 
 impl Ord for PgInterval {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.span().cmp(&other.span())
+        self.span_microseconds().cmp(&other.span_microseconds())
     }
 }
 
 impl Hash for PgInterval {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.span().hash(state);
+        self.span_microseconds().hash(state);
     }
 }
 
@@ -270,33 +301,48 @@ impl IntervalTypmod {
     }
 }
 
-/// Parse an interval as PostgreSQL 18's `interval_in` reads it under the default `IntervalStyle`,
-/// or `None` where PostgreSQL raises an error.
+/// Parse an interval as PostgreSQL 18's `interval_in` reads it under the default `IntervalStyle`.
+///
+/// # Errors
+///
+/// The [`IntervalError`] PostgreSQL raises: [`IntervalError::InvalidSyntax`] for text it cannot
+/// read, [`IntervalError::FieldValueOutOfRange`] for a number beyond its field and
+/// [`IntervalError::OutOfRange`] for years and months beyond the type.
 ///
 /// ```
-/// use sql_scalar_text::{PgInterval, parse_interval};
+/// use sql_scalar_text::{IntervalError, PgInterval, parse_interval};
 ///
 /// let interval = parse_interval("-1 days +02:00:00").unwrap();
 /// assert_eq!(
 ///     (interval.months, interval.days, interval.microseconds),
 ///     (0, -1, 7_200_000_000),
 /// );
+/// assert_eq!(parse_interval("1.5 days").unwrap().to_string(), "1 day 12:00:00");
 /// assert_eq!(parse_interval("@ 1 hour ago").unwrap().to_string(), "-01:00:00");
-/// assert_eq!(parse_interval("PT15M").unwrap().to_string(), "00:15:00");
-/// assert_eq!(parse_interval("-infinity"), Some(PgInterval::NEG_INFINITY));
-/// assert_eq!(parse_interval("1 fortnight"), None);
+/// assert_eq!(parse_interval("P-.5D").unwrap().to_string(), "-12:00:00");
+/// assert_eq!(parse_interval("-infinity"), Ok(PgInterval::NEG_INFINITY));
+/// assert_eq!(parse_interval("p1d"), Err(IntervalError::InvalidSyntax));
+/// assert_eq!(
+///     parse_interval("P1000000000000000D"),
+///     Err(IntervalError::FieldValueOutOfRange),
+/// );
+/// assert_eq!(parse_interval("178956971 years"), Err(IntervalError::OutOfRange));
 /// ```
-#[must_use]
-pub fn parse_interval(text: &str) -> Option<PgInterval> {
+pub fn parse_interval(text: &str) -> Result<PgInterval, IntervalError> {
     interval_in(text, INTERVAL_FULL_RANGE, None)
 }
 
 /// Parse an interval literal of a restricted type as `interval '…' <fields>` reads it, which
 /// differs from casting a text value to that type.
 ///
+/// # Errors
+///
+/// The [`IntervalError`] PostgreSQL raises, as for [`parse_interval`], where rounding the
+/// seconds to the typmod's precision can also leave the type, [`IntervalError::OutOfRange`].
+///
 /// ```
 /// use sql_scalar_text::{
-///     IntervalFields, IntervalTypmod, parse_interval, parse_interval_typmod,
+///     IntervalError, IntervalFields, IntervalTypmod, parse_interval, parse_interval_typmod,
 /// };
 ///
 /// let minute = IntervalTypmod::new(Some(IntervalFields::Minute), None).unwrap();
@@ -304,12 +350,18 @@ pub fn parse_interval(text: &str) -> Option<PgInterval> {
 ///
 /// let to_second = IntervalTypmod::new(Some(IntervalFields::MinuteToSecond), Some(0)).unwrap();
 /// assert_eq!(parse_interval_typmod("1:30.5", to_second).unwrap().to_string(), "00:01:31");
+/// assert_eq!(
+///     parse_interval_typmod("9223372036854775807 usecs", to_second),
+///     Err(IntervalError::OutOfRange),
+/// );
 ///
 /// let hour = IntervalTypmod::new(Some(IntervalFields::Hour), None).unwrap();
 /// assert_eq!(parse_interval_typmod("3 4", hour).unwrap().to_string(), "3 days 04:00:00");
-/// assert_eq!(parse_interval("3 4"), None);
+/// assert_eq!(parse_interval("3 4"), Err(IntervalError::InvalidSyntax));
 /// ```
-#[must_use]
-pub fn parse_interval_typmod(text: &str, typmod: IntervalTypmod) -> Option<PgInterval> {
+pub fn parse_interval_typmod(
+    text: &str,
+    typmod: IntervalTypmod,
+) -> Result<PgInterval, IntervalError> {
     interval_in(text, typmod.range(), typmod.precision)
 }

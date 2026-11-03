@@ -362,7 +362,7 @@ proptest! {
         prop_assume!(!interval.is_finite() || interval.microseconds != i64::MIN);
         let text = interval.to_string();
         let got = parse_interval(&text)
-            .unwrap_or_else(|| panic!("parse_interval: {text:?}"));
+            .unwrap_or_else(|error| panic!("parse_interval: {text:?}: {error}"));
         prop_assert_eq!(
             (got.months, got.days, got.microseconds),
             (interval.months, interval.days, interval.microseconds),

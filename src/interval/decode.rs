@@ -4,7 +4,12 @@
 //! Fractions are `f64` like PostgreSQL's `double`, since exact decimals round
 //! `'1.999999999 millisecond'` differently.
 
-use super::PgInterval;
+use super::{
+    IntervalError, PgInterval,
+    float::{
+        fits_in_i32, fits_in_i64, int_to_f64, round_ties_even, truncate_to_i32, truncate_to_i64,
+    },
+};
 
 const MONTHS_PER_YEAR: i32 = 12;
 const DAYS_PER_MONTH: i32 = 30;
@@ -239,31 +244,28 @@ const DATE_TOKENS: &[(&str, i32, i32)] = &[
     ("yesterday", RESERV, DTK_YESTERDAY),
 ];
 
-/// Why PostgreSQL refuses a literal, as far as `interval_in` tells them apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refusal {
-    /// `invalid input syntax for type interval`, after which `interval_in`
-    /// tries the ISO 8601 format.
-    BadFormat,
-    /// `interval field value out of range` or `interval out of range`.
-    OutOfRange,
-}
-
 /// Reads `text` as PostgreSQL reads an interval literal whose typmod keeps the fields in `range`
 /// and rounds seconds to `precision` digits.
-pub(super) fn interval_in(text: &str, range: u16, precision: Option<u8>) -> Option<PgInterval> {
+///
+/// Only [`IntervalError::InvalidSyntax`] sends the literal on to the ISO 8601 decoder, whose
+/// answer is final.
+pub(super) fn interval_in(
+    text: &str,
+    range: u16,
+    precision: Option<u8>,
+) -> Result<PgInterval, IntervalError> {
     let decoded =
         match parse_date_time(text.as_bytes()).and_then(|tokens| decode_interval(&tokens, range)) {
-            Err(Refusal::BadFormat) => decode_iso8601_interval(text.as_bytes()),
+            Err(IntervalError::InvalidSyntax) => decode_iso8601_interval(text.as_bytes()),
             other => other,
         };
-    let mut result = match decoded.ok()? {
-        (DTK_LATE, _) => return Some(PgInterval::INFINITY),
-        (DTK_EARLY, _) => return Some(PgInterval::NEG_INFINITY),
+    let mut result = match decoded? {
+        (DTK_LATE, _) => return Ok(PgInterval::INFINITY),
+        (DTK_EARLY, _) => return Ok(PgInterval::NEG_INFINITY),
         (_, itm_in) => itmin2interval(&itm_in)?,
     };
     adjust_interval_for_typmod(&mut result, range, precision)?;
-    Some(result)
+    Ok(result)
 }
 
 /// `struct pg_itm_in`, the counts the decoders accumulate.
@@ -311,9 +313,9 @@ struct Tokens {
 impl Tokens {
     /// Appends one byte to the token being written, refusing a literal whose
     /// tokens overrun the work buffer.
-    fn push(&mut self, byte: u8) -> Result<(), Refusal> {
+    fn push(&mut self, byte: u8) -> Result<(), IntervalError> {
         if self.used + 1 >= WORKBUF_LEN {
-            return Err(Refusal::BadFormat);
+            return Err(IntervalError::InvalidSyntax);
         }
         self.bytes[self.used] = byte;
         self.used += 1;
@@ -339,7 +341,7 @@ impl Tokens {
 }
 
 /// `ParseDateTime`, which splits a literal into typed tokens.
-fn parse_date_time(input: &[u8]) -> Result<Tokens, Refusal> {
+fn parse_date_time(input: &[u8]) -> Result<Tokens, IntervalError> {
     let mut tokens = Tokens {
         bytes: [0; WORKBUF_LEN],
         used: 0,
@@ -359,7 +361,7 @@ fn parse_date_time(input: &[u8]) -> Result<Tokens, Refusal> {
             continue;
         }
         if tokens.count >= MAX_DATE_FIELDS {
-            return Err(Refusal::BadFormat);
+            return Err(IntervalError::InvalidSyntax);
         }
         let start = tokens.used;
         let kind;
@@ -471,13 +473,13 @@ fn parse_date_time(input: &[u8]) -> Result<Tokens, Refusal> {
                 }
                 kind = FieldType::Special;
             } else {
-                return Err(Refusal::BadFormat);
+                return Err(IntervalError::InvalidSyntax);
             }
         } else if current.is_ascii_punctuation() {
             at += 1;
             continue;
         } else {
-            return Err(Refusal::BadFormat);
+            return Err(IntervalError::InvalidSyntax);
         }
         tokens.finish(start, kind);
     }
@@ -558,35 +560,39 @@ fn strtoint(text: &[u8], start: usize) -> (i32, usize, bool) {
 }
 
 /// `ParseFraction`, the value of the `.digits` ending a token.
-fn parse_fraction(text: &[u8]) -> Result<f64, Refusal> {
+fn parse_fraction(text: &[u8]) -> Result<f64, IntervalError> {
     debug_assert_eq!(text.first(), Some(&b'.'), "a fraction starts at its point");
     if text.len() == 1 {
         return Ok(0.0);
     }
     if !text[1..].iter().all(u8::is_ascii_digit) {
-        return Err(Refusal::BadFormat);
+        return Err(IntervalError::InvalidSyntax);
     }
     core::str::from_utf8(text)
         .ok()
         .and_then(|digits| digits.parse::<f64>().ok())
-        .ok_or(Refusal::BadFormat)
+        .ok_or(IntervalError::InvalidSyntax)
 }
 
 /// `ParseFractionalSecond`, a fraction as whole microseconds.
-fn parse_fractional_second(text: &[u8]) -> Result<i32, Refusal> {
+fn parse_fractional_second(text: &[u8]) -> Result<i32, IntervalError> {
     let fraction = parse_fraction(text)?;
     Ok(truncate_to_i32(round_ties_even(fraction * 1_000_000.0)))
 }
 
 /// `AdjustFractMicroseconds`, adding `frac * scale` microseconds with a remainder above one half
 /// rounded away from zero.
-fn adjust_fract_microseconds(frac: f64, scale: i64, itm_in: &mut ItmIn) -> Result<(), Refusal> {
+fn adjust_fract_microseconds(
+    frac: f64,
+    scale: i64,
+    itm_in: &mut ItmIn,
+) -> Result<(), IntervalError> {
     if frac == 0.0 {
         return Ok(());
     }
     let mut frac = frac * int_to_f64(scale);
     if !fits_in_i64(frac) {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     let mut usec = truncate_to_i64(frac);
     frac -= int_to_f64(usec);
@@ -595,98 +601,124 @@ fn adjust_fract_microseconds(frac: f64, scale: i64, itm_in: &mut ItmIn) -> Resul
     } else if frac < -0.5 {
         usec -= 1;
     }
-    itm_in.usec = itm_in.usec.checked_add(usec).ok_or(Refusal::OutOfRange)?;
+    itm_in.usec = itm_in
+        .usec
+        .checked_add(usec)
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
     Ok(())
 }
 
 /// `AdjustFractDays`, adding `frac * scale` days and the fraction of a day as microseconds.
-fn adjust_fract_days(frac: f64, scale: i32, itm_in: &mut ItmIn) -> Result<(), Refusal> {
+fn adjust_fract_days(frac: f64, scale: i32, itm_in: &mut ItmIn) -> Result<(), IntervalError> {
     if frac == 0.0 {
         return Ok(());
     }
     let mut frac = frac * f64::from(scale);
     if !fits_in_i32(frac) {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     let extra_days = truncate_to_i32(frac);
     itm_in.mday = itm_in
         .mday
         .checked_add(extra_days)
-        .ok_or(Refusal::OutOfRange)?;
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
     frac -= f64::from(extra_days);
     adjust_fract_microseconds(frac, USECS_PER_DAY, itm_in)
 }
 
 /// `AdjustFractYears`, adding `frac * scale` years as whole months.
-fn adjust_fract_years(frac: f64, scale: i32, itm_in: &mut ItmIn) -> Result<(), Refusal> {
+fn adjust_fract_years(frac: f64, scale: i32, itm_in: &mut ItmIn) -> Result<(), IntervalError> {
     let months = round_ties_even(frac * f64::from(scale) * f64::from(MONTHS_PER_YEAR));
     if !fits_in_i32(months) {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     itm_in.mon = itm_in
         .mon
         .checked_add(truncate_to_i32(months))
-        .ok_or(Refusal::OutOfRange)?;
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
     Ok(())
 }
 
 /// `AdjustMicroseconds`, adding `(val + fval) * scale` microseconds.
-fn adjust_microseconds(val: i64, fval: f64, scale: i64, itm_in: &mut ItmIn) -> Result<(), Refusal> {
+fn adjust_microseconds(
+    val: i64,
+    fval: f64,
+    scale: i64,
+    itm_in: &mut ItmIn,
+) -> Result<(), IntervalError> {
     multiply_add(val, scale, &mut itm_in.usec)?;
     adjust_fract_microseconds(fval, scale, itm_in)
 }
 
 /// `AdjustDays`.
-fn adjust_days(val: i64, scale: i32, itm_in: &mut ItmIn) -> Result<(), Refusal> {
-    let val = i32::try_from(val).map_err(|_| Refusal::OutOfRange)?;
-    let days = val.checked_mul(scale).ok_or(Refusal::OutOfRange)?;
-    itm_in.mday = itm_in.mday.checked_add(days).ok_or(Refusal::OutOfRange)?;
+fn adjust_days(val: i64, scale: i32, itm_in: &mut ItmIn) -> Result<(), IntervalError> {
+    let val = i32::try_from(val).map_err(|_| IntervalError::FieldValueOutOfRange)?;
+    let days = val
+        .checked_mul(scale)
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
+    itm_in.mday = itm_in
+        .mday
+        .checked_add(days)
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
     Ok(())
 }
 
 /// `AdjustMonths`.
-fn adjust_months(val: i64, itm_in: &mut ItmIn) -> Result<(), Refusal> {
-    let val = i32::try_from(val).map_err(|_| Refusal::OutOfRange)?;
-    itm_in.mon = itm_in.mon.checked_add(val).ok_or(Refusal::OutOfRange)?;
+fn adjust_months(val: i64, itm_in: &mut ItmIn) -> Result<(), IntervalError> {
+    let val = i32::try_from(val).map_err(|_| IntervalError::FieldValueOutOfRange)?;
+    itm_in.mon = itm_in
+        .mon
+        .checked_add(val)
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
     Ok(())
 }
 
 /// `AdjustYears`.
-fn adjust_years(val: i64, scale: i32, itm_in: &mut ItmIn) -> Result<(), Refusal> {
-    let val = i32::try_from(val).map_err(|_| Refusal::OutOfRange)?;
-    let years = val.checked_mul(scale).ok_or(Refusal::OutOfRange)?;
-    itm_in.year = itm_in.year.checked_add(years).ok_or(Refusal::OutOfRange)?;
+fn adjust_years(val: i64, scale: i32, itm_in: &mut ItmIn) -> Result<(), IntervalError> {
+    let val = i32::try_from(val).map_err(|_| IntervalError::FieldValueOutOfRange)?;
+    let years = val
+        .checked_mul(scale)
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
+    itm_in.year = itm_in
+        .year
+        .checked_add(years)
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
     Ok(())
 }
 
 /// `int64_multiply_add`, adding `val * multiplier` to `sum` unless it overflows.
-fn multiply_add(val: i64, multiplier: i64, sum: &mut i64) -> Result<(), Refusal> {
+fn multiply_add(val: i64, multiplier: i64, sum: &mut i64) -> Result<(), IntervalError> {
     *sum = val
         .checked_mul(multiplier)
         .and_then(|product| sum.checked_add(product))
-        .ok_or(Refusal::OutOfRange)?;
+        .ok_or(IntervalError::FieldValueOutOfRange)?;
     Ok(())
 }
 
 /// `DecodeTimeForInterval`, replacing the time with the `h:m[:s][.f]` token's microseconds.
-fn decode_time_for_interval(text: &[u8], range: u16, itm_in: &mut ItmIn) -> Result<(), Refusal> {
+fn decode_time_for_interval(
+    text: &[u8],
+    range: u16,
+    itm_in: &mut ItmIn,
+) -> Result<(), IntervalError> {
     let (mut hour, end, overflowed) = strtoll(text, 0);
     if overflowed {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     if text.get(end) != Some(&b':') {
-        return Err(Refusal::BadFormat);
+        return Err(IntervalError::InvalidSyntax);
     }
     let (mut minute, end, overflowed) = strtoint(text, end + 1);
     if overflowed {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     let mut second = 0_i32;
     let mut fsec = 0_i32;
     match text.get(end) {
         None => {
             if range == RANGE_MINUTE | RANGE_SECOND {
-                let as_minutes = i32::try_from(hour).map_err(|_| Refusal::OutOfRange)?;
+                let as_minutes =
+                    i32::try_from(hour).map_err(|_| IntervalError::FieldValueOutOfRange)?;
                 second = minute;
                 minute = as_minutes;
                 hour = 0;
@@ -694,7 +726,8 @@ fn decode_time_for_interval(text: &[u8], range: u16, itm_in: &mut ItmIn) -> Resu
         }
         Some(b'.') => {
             fsec = parse_fractional_second(&text[end..])?;
-            let as_minutes = i32::try_from(hour).map_err(|_| Refusal::OutOfRange)?;
+            let as_minutes =
+                i32::try_from(hour).map_err(|_| IntervalError::FieldValueOutOfRange)?;
             second = minute;
             minute = as_minutes;
             hour = 0;
@@ -702,23 +735,23 @@ fn decode_time_for_interval(text: &[u8], range: u16, itm_in: &mut ItmIn) -> Resu
         Some(b':') => {
             let (parsed, end, overflowed) = strtoint(text, end + 1);
             if overflowed {
-                return Err(Refusal::OutOfRange);
+                return Err(IntervalError::FieldValueOutOfRange);
             }
             second = parsed;
             match text.get(end) {
                 Some(b'.') => fsec = parse_fractional_second(&text[end..])?,
                 None => {}
-                Some(_) => return Err(Refusal::BadFormat),
+                Some(_) => return Err(IntervalError::InvalidSyntax),
             }
         }
-        Some(_) => return Err(Refusal::BadFormat),
+        Some(_) => return Err(IntervalError::InvalidSyntax),
     }
     if hour < 0
         || !(0..MINS_PER_HOUR).contains(&minute)
         || !(0..=SECS_PER_MINUTE).contains(&second)
         || !(0..=1_000_000).contains(&fsec)
     {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     itm_in.usec = i64::from(fsec);
     multiply_add(hour, USECS_PER_HOUR, &mut itm_in.usec)?;
@@ -746,7 +779,7 @@ fn default_unit(range: u16) -> i32 {
 }
 
 /// `DecodeInterval`, reading tokens right to left so a unit is known before its number.
-fn decode_interval(tokens: &Tokens, range: u16) -> Result<(i32, ItmIn), Refusal> {
+fn decode_interval(tokens: &Tokens, range: u16) -> Result<(i32, ItmIn), IntervalError> {
     let mut itm_in = ItmIn::default();
     let mut dtype = DTK_DELTA;
     let mut is_before = false;
@@ -766,7 +799,10 @@ fn decode_interval(tokens: &Tokens, range: u16) -> Result<(i32, ItmIn), Refusal>
                     && decode_time_for_interval(&text[1..], range, &mut itm_in).is_ok() =>
             {
                 if text[0] == b'-' {
-                    itm_in.usec = itm_in.usec.checked_neg().ok_or(Refusal::OutOfRange)?;
+                    itm_in.usec = itm_in
+                        .usec
+                        .checked_neg()
+                        .ok_or(IntervalError::FieldValueOutOfRange)?;
                 }
                 tmask = DTK_TIME_M;
                 kind = DTK_DAY;
@@ -787,7 +823,7 @@ fn decode_interval(tokens: &Tokens, range: u16) -> Result<(i32, ItmIn), Refusal>
             }
             FieldType::String | FieldType::Special => {
                 if parsing_unit_val {
-                    return Err(Refusal::BadFormat);
+                    return Err(IntervalError::InvalidSyntax);
                 }
                 let (word_type, value) = decode_word(text);
                 kind = word_type;
@@ -803,7 +839,7 @@ fn decode_interval(tokens: &Tokens, range: u16) -> Result<(i32, ItmIn), Refusal>
                     AGO => {
                         // `ago` may only end the interval.
                         if index != last {
-                            return Err(Refusal::BadFormat);
+                            return Err(IntervalError::InvalidSyntax);
                         }
                         is_before = true;
                         kind = value;
@@ -812,48 +848,60 @@ fn decode_interval(tokens: &Tokens, range: u16) -> Result<(i32, ItmIn), Refusal>
                     RESERV => {
                         // Only the infinities, and nothing may follow them.
                         if (value != DTK_LATE && value != DTK_EARLY) || index != last {
-                            return Err(Refusal::BadFormat);
+                            return Err(IntervalError::InvalidSyntax);
                         }
                         dtype = value;
                         DTK_DATE_M | DTK_TIME_M
                     }
-                    _ => return Err(Refusal::BadFormat),
+                    _ => return Err(IntervalError::InvalidSyntax),
                 };
             }
         }
 
         if tmask & fmask != 0 {
-            return Err(Refusal::BadFormat);
+            return Err(IntervalError::InvalidSyntax);
         }
         fmask |= tmask;
     }
 
     if fmask == 0 || parsing_unit_val {
-        return Err(Refusal::BadFormat);
+        return Err(IntervalError::InvalidSyntax);
     }
     if is_before {
         itm_in = ItmIn {
-            usec: itm_in.usec.checked_neg().ok_or(Refusal::OutOfRange)?,
-            mday: itm_in.mday.checked_neg().ok_or(Refusal::OutOfRange)?,
-            mon: itm_in.mon.checked_neg().ok_or(Refusal::OutOfRange)?,
-            year: itm_in.year.checked_neg().ok_or(Refusal::OutOfRange)?,
+            usec: itm_in
+                .usec
+                .checked_neg()
+                .ok_or(IntervalError::FieldValueOutOfRange)?,
+            mday: itm_in
+                .mday
+                .checked_neg()
+                .ok_or(IntervalError::FieldValueOutOfRange)?,
+            mon: itm_in
+                .mon
+                .checked_neg()
+                .ok_or(IntervalError::FieldValueOutOfRange)?,
+            year: itm_in
+                .year
+                .checked_neg()
+                .ok_or(IntervalError::FieldValueOutOfRange)?,
         };
     }
     Ok((dtype, itm_in))
 }
 
 /// `ParseISO8601Number`, a `strtod` number split into its integer part and leftover fraction.
-fn parse_iso8601_number(text: &[u8], start: usize) -> Result<(i64, f64, usize), Refusal> {
+fn parse_iso8601_number(text: &[u8], start: usize) -> Result<(i64, f64, usize), IntervalError> {
     let first = text.get(start).copied().unwrap_or(0);
     if !(first.is_ascii_digit() || first == b'-' || first == b'.') {
-        return Err(Refusal::BadFormat);
+        return Err(IntervalError::InvalidSyntax);
     }
-    let (value, end, out_of_range) = strtod(text, start).ok_or(Refusal::BadFormat)?;
+    let (value, end, out_of_range) = strtod(text, start).ok_or(IntervalError::InvalidSyntax)?;
     if out_of_range {
-        return Err(Refusal::BadFormat);
+        return Err(IntervalError::InvalidSyntax);
     }
     if value.is_nan() || !(-1.0e15..=1.0e15).contains(&value) {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     // Within 1e15 the integer part is exact and the cast truncates towards
     // zero, which is what PostgreSQL's floor of the magnitude does.
@@ -876,10 +924,14 @@ fn iso8601_integer_width(text: &[u8], start: usize) -> usize {
 
 /// The number branch of `DecodeInterval`, answering the field mask set and the unit the next
 /// number defaults to.
-fn decode_number(text: &[u8], mut kind: i32, itm_in: &mut ItmIn) -> Result<(u32, i32), Refusal> {
+fn decode_number(
+    text: &[u8],
+    mut kind: i32,
+    itm_in: &mut ItmIn,
+) -> Result<(u32, i32), IntervalError> {
     let (mut val, end, overflowed) = strtoll(text, 0);
     if overflowed {
-        return Err(Refusal::OutOfRange);
+        return Err(IntervalError::FieldValueOutOfRange);
     }
     let fval;
     match text.get(end) {
@@ -887,10 +939,10 @@ fn decode_number(text: &[u8], mut kind: i32, itm_in: &mut ItmIn) -> Result<(u32,
             // The SQL standard `years-months` form.
             let (mut months, end, overflowed) = strtoint(text, end + 1);
             if overflowed || !(0..MONTHS_PER_YEAR).contains(&months) {
-                return Err(Refusal::OutOfRange);
+                return Err(IntervalError::FieldValueOutOfRange);
             }
             if end != text.len() {
-                return Err(Refusal::BadFormat);
+                return Err(IntervalError::InvalidSyntax);
             }
             kind = DTK_MONTH;
             if text[0] == b'-' {
@@ -899,7 +951,7 @@ fn decode_number(text: &[u8], mut kind: i32, itm_in: &mut ItmIn) -> Result<(u32,
             val = val
                 .checked_mul(i64::from(MONTHS_PER_YEAR))
                 .and_then(|scaled| scaled.checked_add(i64::from(months)))
-                .ok_or(Refusal::OutOfRange)?;
+                .ok_or(IntervalError::FieldValueOutOfRange)?;
             fval = 0.0;
         }
         Some(b'.') => {
@@ -907,7 +959,7 @@ fn decode_number(text: &[u8], mut kind: i32, itm_in: &mut ItmIn) -> Result<(u32,
             fval = if text[0] == b'-' { -fraction } else { fraction };
         }
         None => fval = 0.0,
-        Some(_) => return Err(Refusal::BadFormat),
+        Some(_) => return Err(IntervalError::InvalidSyntax),
     }
     let tmask = match kind {
         DTK_MICROSEC => {
@@ -962,7 +1014,7 @@ fn decode_number(text: &[u8], mut kind: i32, itm_in: &mut ItmIn) -> Result<(u32,
             adjust_fract_years(fval, scale, itm_in)?;
             dtk_m(field)
         }
-        _ => return Err(Refusal::BadFormat),
+        _ => return Err(IntervalError::InvalidSyntax),
     };
     Ok((tmask, kind))
 }
@@ -973,7 +1025,7 @@ fn add_iso8601_date_designator(
     val: i64,
     fval: f64,
     itm_in: &mut ItmIn,
-) -> Result<(), Refusal> {
+) -> Result<(), IntervalError> {
     match unit {
         b'Y' => {
             adjust_years(val, 1, itm_in)?;
@@ -991,15 +1043,15 @@ fn add_iso8601_date_designator(
             adjust_days(val, 1, itm_in)?;
             adjust_fract_microseconds(fval, USECS_PER_DAY, itm_in)
         }
-        _ => Err(Refusal::BadFormat),
+        _ => Err(IntervalError::InvalidSyntax),
     }
 }
 
 /// `DecodeISO8601Interval`, reading the designator and alternative formats of ISO 8601.
-fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), Refusal> {
+fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), IntervalError> {
     let mut itm_in = ItmIn::default();
     if text.len() < 2 || text[0] != b'P' {
-        return Err(Refusal::BadFormat);
+        return Err(IntervalError::InvalidSyntax);
     }
     let byte = |index: usize| text.get(index).copied().unwrap_or(0);
     let mut datepart = true;
@@ -1039,7 +1091,7 @@ fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), Refusal> {
             }
             // The extended alternative format, `YYYY-MM-DD`.
             if havefield {
-                return Err(Refusal::BadFormat);
+                return Err(IntervalError::InvalidSyntax);
             }
             adjust_years(val, 1, &mut itm_in)?;
             adjust_fract_years(fval, 1, &mut itm_in)?;
@@ -1062,7 +1114,7 @@ fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), Refusal> {
                     continue;
                 }
                 b'-' => at += 1,
-                _ => return Err(Refusal::BadFormat),
+                _ => return Err(IntervalError::InvalidSyntax),
             }
             (val, fval, at) = parse_iso8601_number(text, at)?;
             adjust_days(val, 1, &mut itm_in)?;
@@ -1074,7 +1126,7 @@ fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), Refusal> {
                     havefield = false;
                     continue;
                 }
-                _ => return Err(Refusal::BadFormat),
+                _ => return Err(IntervalError::InvalidSyntax),
             }
         }
         match unit {
@@ -1092,7 +1144,7 @@ fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), Refusal> {
                 }
                 // The extended alternative format, `hh:mm:ss`.
                 if havefield {
-                    return Err(Refusal::BadFormat);
+                    return Err(IntervalError::InvalidSyntax);
                 }
                 adjust_microseconds(val, fval, USECS_PER_HOUR, &mut itm_in)?;
                 if unit == 0 {
@@ -1103,16 +1155,16 @@ fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), Refusal> {
                 match byte(at) {
                     0 => return Ok((DTK_DELTA, itm_in)),
                     b':' => at += 1,
-                    _ => return Err(Refusal::BadFormat),
+                    _ => return Err(IntervalError::InvalidSyntax),
                 }
                 (val, fval, at) = parse_iso8601_number(text, at)?;
                 adjust_microseconds(val, fval, USECS_PER_SEC, &mut itm_in)?;
                 if byte(at) == 0 {
                     return Ok((DTK_DELTA, itm_in));
                 }
-                return Err(Refusal::BadFormat);
+                return Err(IntervalError::InvalidSyntax);
             }
-            _ => return Err(Refusal::BadFormat),
+            _ => return Err(IntervalError::InvalidSyntax),
         }
         havefield = true;
     }
@@ -1120,27 +1172,26 @@ fn decode_iso8601_interval(text: &[u8]) -> Result<(i32, ItmIn), Refusal> {
 }
 
 /// `itmin2interval`, refusing a month count beyond `int`.
-fn itmin2interval(itm_in: &ItmIn) -> Option<PgInterval> {
+fn itmin2interval(itm_in: &ItmIn) -> Result<PgInterval, IntervalError> {
     let total_months = i64::from(itm_in.year) * i64::from(MONTHS_PER_YEAR) + i64::from(itm_in.mon);
-    Some(PgInterval {
-        months: i32::try_from(total_months).ok()?,
+    Ok(PgInterval {
+        months: i32::try_from(total_months).map_err(|_| IntervalError::OutOfRange)?,
         days: itm_in.mday,
         microseconds: itm_in.usec,
     })
 }
 
-/// `AdjustIntervalForTypmod`, truncating below the last kept field and rounding the seconds, or
-/// `None` on overflow.
+/// `AdjustIntervalForTypmod`, truncating below the last kept field and rounding the seconds.
 fn adjust_interval_for_typmod(
     interval: &mut PgInterval,
     range: u16,
     precision: Option<u8>,
-) -> Option<()> {
+) -> Result<(), IntervalError> {
     const SCALES: [i64; 7] = [1_000_000, 100_000, 10_000, 1_000, 100, 10, 1];
     const OFFSETS: [i64; 7] = [500_000, 50_000, 5_000, 500, 50, 5, 0];
 
     if !interval.is_finite() {
-        return Some(());
+        return Ok(());
     }
     if range == RANGE_YEAR {
         interval.months = (interval.months / MONTHS_PER_YEAR) * MONTHS_PER_YEAR;
@@ -1165,10 +1216,11 @@ fn adjust_interval_for_typmod(
             interval.microseconds.checked_add(OFFSETS[precision])
         } else {
             interval.microseconds.checked_sub(OFFSETS[precision])
-        }?;
+        }
+        .ok_or(IntervalError::OutOfRange)?;
         interval.microseconds = shifted - shifted % SCALES[precision];
     }
-    Some(())
+    Ok(())
 }
 
 /// `strtod` past a first byte that is not `+`, answering the value, where it ends, and whether C
@@ -1352,54 +1404,4 @@ fn hex_to_f64(mantissa: u64, exponent: i64, sticky: bool) -> f64 {
         }
     }
     value
-}
-
-/// `rint` in the default rounding mode.
-fn round_ties_even(value: f64) -> f64 {
-    const TWO_POW_52: f64 = 4_503_599_627_370_496.0;
-    let magnitude = if value.is_sign_negative() {
-        -value
-    } else {
-        value
-    };
-    if magnitude >= TWO_POW_52 {
-        return value;
-    }
-    // At 2^52 no fraction bits are left, so the addition rounds ties to even.
-    let rounded = (magnitude + TWO_POW_52) - TWO_POW_52;
-    if value.is_sign_negative() {
-        -rounded
-    } else {
-        rounded
-    }
-}
-
-/// `FLOAT8_FITS_IN_INT32`.
-fn fits_in_i32(value: f64) -> bool {
-    !value.is_nan() && value >= f64::from(i32::MIN) && value < -f64::from(i32::MIN)
-}
-
-/// `FLOAT8_FITS_IN_INT64`.
-fn fits_in_i64(value: f64) -> bool {
-    !value.is_nan() && value >= int_to_f64(i64::MIN) && value < -int_to_f64(i64::MIN)
-}
-
-/// C's `(int)` conversion of a double the caller has bounded inside `int`.
-fn truncate_to_i32(value: f64) -> i32 {
-    debug_assert!(fits_in_i32(value), "{value} does not fit an int");
-    // Intended loss, as C's `(int)` cast truncates towards zero.
-    value as i32
-}
-
-/// C's `(int64)` conversion of a double the caller has bounded inside `int64`.
-fn truncate_to_i64(value: f64) -> i64 {
-    debug_assert!(fits_in_i64(value), "{value} does not fit an int64");
-    // Intended loss, as C's `(int64)` cast truncates towards zero.
-    value as i64
-}
-
-/// C's conversion of an integer operand to `double`.
-fn int_to_f64(value: i64) -> f64 {
-    // Intended loss, as C rounds an `int64` beyond 2^53 to the nearest double.
-    value as f64
 }

@@ -6,7 +6,8 @@ extern crate alloc;
 mod interval;
 
 pub use interval::{
-    IntervalFields, IntervalTypmod, PgInterval, parse_interval, parse_interval_typmod,
+    IntervalError, IntervalFields, IntervalSum, IntervalTypmod, PgInterval, ShiftError,
+    parse_interval, parse_interval_typmod,
 };
 
 use alloc::vec::Vec;

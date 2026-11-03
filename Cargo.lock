@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "sql-scalar-text"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -2268,8 +2268,10 @@ dependencies = [
  "diesel",
  "parking_lot",
  "proptest",
+ "serde",
  "testcontainers",
  "testcontainers-modules",
+ "thiserror",
 ]
 
 [[package]]

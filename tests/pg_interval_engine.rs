@@ -1,5 +1,6 @@
-//! Intervals read, printed and compared as PostgreSQL 18 does, with PostgreSQL 16 pinning only
-//! the printed text since its literal grammar differs (it accepts `1 day ago 2`).
+//! Intervals read, printed and compared as PostgreSQL 18 does, refusals by the message PostgreSQL
+//! raises, with PostgreSQL 16 pinning only the printed text since its literal grammar differs (it
+//! accepts `1 day ago 2`).
 //!
 //! PostgreSQL 18 runs on the Debian image because `interval_in` reads ISO 8601 numbers with the
 //! C library's `strtod`, and musl reads `PT4.9e-324S` as zero where glibc refuses it.
@@ -21,11 +22,12 @@ use std::{
 use diesel::{
     dsl::sql,
     prelude::*,
-    sql_types::{Bool, Integer, Text},
+    sql_types::{Integer, Nullable, Text},
 };
 use interval_literals::LITERALS;
 use sql_scalar_text::{
-    IntervalFields, IntervalTypmod, PgInterval, parse_interval, parse_interval_typmod,
+    IntervalError, IntervalFields, IntervalTypmod, PgInterval, parse_interval,
+    parse_interval_typmod,
 };
 
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
@@ -80,27 +82,48 @@ fn typmods() -> Vec<(&'static str, IntervalTypmod)> {
     ]
 }
 
-/// The text PostgreSQL prints for `literal` read as `type_name`, or `None` when it refuses it.
-fn pg_interval_text(conn: &mut PgConnection, literal: &str, type_name: &str) -> Option<String> {
-    // Raw SQL, since `pg_input_is_valid` has no DSL form.
-    let valid: bool = diesel::select(
-        sql::<Bool>("pg_input_is_valid(")
+/// The crate's error for a message PostgreSQL raises, which names the input after a colon for a
+/// literal it cannot read.
+fn pg_error(message: &str) -> IntervalError {
+    [
+        IntervalError::InvalidSyntax,
+        IntervalError::FieldValueOutOfRange,
+        IntervalError::OutOfRange,
+        IntervalError::DivisionByZero,
+    ]
+    .into_iter()
+    .find(|error| {
+        let stem = error.to_string();
+        message == stem || message.starts_with(&format!("{stem}: "))
+    })
+    .unwrap_or_else(|| panic!("PostgreSQL raised {message:?}"))
+}
+
+/// The text PostgreSQL prints for `literal` read as `type_name`, or the error it raises.
+fn pg_interval_text(
+    conn: &mut PgConnection,
+    literal: &str,
+    type_name: &str,
+) -> Result<String, IntervalError> {
+    // Raw SQL, since `pg_input_error_info` has no DSL form.
+    let message: Option<String> = diesel::select(
+        sql::<Nullable<Text>>("(pg_input_error_info(")
             .bind::<Text, _>(literal)
             .sql(", ")
             .bind::<Text, _>(type_name)
-            .sql(")"),
+            .sql(")).message"),
     )
     .get_result(conn)
-    .unwrap_or_else(|e| panic!("pg_input_is_valid({literal:?}, {type_name:?}): {e}"));
-    if !valid {
-        return None;
+    .unwrap_or_else(|e| panic!("pg_input_error_info({literal:?}, {type_name:?}): {e}"));
+    if let Some(message) = message {
+        return Err(pg_error(&message));
     }
     // Raw SQL with the literal inline, since a bound parameter skips the typmod in `interval_in`.
     let quoted = format!("'{}'", literal.replace('\'', "''"));
     let text: String = diesel::select(sql::<Text>(&format!("({quoted}::{type_name})::text")))
         .get_result(conn)
         .unwrap_or_else(|e| panic!("{literal:?}::{type_name}: {e}"));
-    Some(text)
+    Ok(text)
 }
 
 /// PostgreSQL's `interval_cmp` of two literals it accepts.
@@ -169,7 +192,7 @@ fn assert_printer_matches(conn: &mut PgConnection, holds_infinity: bool) {
         let literal = fields_literal(&interval);
         let expected = pg_interval_text(conn, &literal, "interval");
         let printed = interval.to_string();
-        if expected.as_deref() != Some(printed.as_str()) {
+        if expected.as_deref() != Ok(printed.as_str()) {
             mismatches.push(format!(
                 "{interval:?}: crate {printed:?}, PostgreSQL {expected:?}"
             ));
@@ -181,7 +204,7 @@ fn assert_printer_matches(conn: &mut PgConnection, holds_infinity: bool) {
                 "{printed:?} reads back as {reread:?}, PostgreSQL {engine_reread:?}"
             ));
         }
-        if let Some(reread) = reread
+        if let Ok(reread) = reread
             && (reread.months, reread.days, reread.microseconds)
                 != (interval.months, interval.days, interval.microseconds)
         {
@@ -193,7 +216,7 @@ fn assert_printer_matches(conn: &mut PgConnection, holds_infinity: bool) {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-/// Every literal of the corpus under every interval type.
+/// Every literal of the corpus under every interval type, the value or the refusal's message.
 #[test]
 fn pg18_reads_every_literal_under_every_interval_type() {
     let mut conn = postgres::connect(&PG18, PG18_TAG);
@@ -230,7 +253,7 @@ fn pg18_orders_and_equates_every_pair() {
     let mut conn = postgres::connect(&PG18, PG18_TAG);
     let mut values: Vec<(String, PgInterval)> = LITERALS
         .iter()
-        .filter_map(|&literal| Some((literal.to_owned(), parse_interval(literal)?)))
+        .filter_map(|&literal| Some((literal.to_owned(), parse_interval(literal).ok()?)))
         .collect();
     values.extend(
         printer_fields()

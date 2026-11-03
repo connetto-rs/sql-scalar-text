@@ -30,7 +30,7 @@ fn assert_reprints(text: &str, parsed: PgInterval) {
     }
     let printed = parsed.to_string();
     let reread = parse_interval(&printed)
-        .unwrap_or_else(|| panic!("{text:?} printed as {printed:?}, which does not parse"));
+        .unwrap_or_else(|error| panic!("{text:?} printed as {printed:?}, which reads as {error}"));
     assert_eq!(
         (reread.months, reread.days, reread.microseconds),
         (parsed.months, parsed.days, parsed.microseconds),
@@ -42,7 +42,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(text) = core::str::from_utf8(data) else {
         return;
     };
-    if let Some(parsed) = parse_interval(text) {
+    if let Ok(parsed) = parse_interval(text) {
         assert_reprints(text, parsed);
     }
     // The length picks a typmod, so no input byte is spent choosing one.
@@ -51,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
         .ok()
         .filter(|&p| p < 7);
     if let Some(typmod) = IntervalTypmod::new(fields, precision)
-        && let Some(parsed) = parse_interval_typmod(text, typmod)
+        && let Ok(parsed) = parse_interval_typmod(text, typmod)
     {
         assert_reprints(text, parsed);
     }
