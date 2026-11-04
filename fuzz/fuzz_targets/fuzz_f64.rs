@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sql_scalar_text::parse_f64;
+use sql_values::parse_f64;
 
 /// Rust's shortest exponent form, and its mantissa with the exponent PostgreSQL and SQLite print.
 fn exponent_spellings(value: f64, spellings: &mut Vec<String>) {

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sql_scalar_text::parse_pg_bytea_hex;
+use sql_values::parse_pg_bytea_hex;
 
 /// Decode through `u8::from_str_radix`, independently of the crate's nibble table.
 fn reference(text: &str) -> Option<Vec<u8>> {

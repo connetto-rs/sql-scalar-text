@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sql_scalar_text::parse_i64;
+use sql_values::parse_i64;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = core::str::from_utf8(data) else {

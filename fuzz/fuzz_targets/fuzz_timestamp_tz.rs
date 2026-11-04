@@ -7,7 +7,7 @@ mod time_spellings;
 
 use chrono::FixedOffset;
 use libfuzzer_sys::fuzz_target;
-use sql_scalar_text::{parse_timestamp, parse_timestamp_tz};
+use sql_values::{parse_timestamp, parse_timestamp_tz};
 
 /// Zero, whole-hour, half-hour and local-mean-time offsets, the last as PostgreSQL prints it.
 const OFFSETS: [i32; 5] = [

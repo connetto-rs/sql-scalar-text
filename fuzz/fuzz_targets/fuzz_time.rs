@@ -4,7 +4,7 @@
 mod time_spellings;
 
 use libfuzzer_sys::fuzz_target;
-use sql_scalar_text::parse_time;
+use sql_values::parse_time;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = core::str::from_utf8(data) else {

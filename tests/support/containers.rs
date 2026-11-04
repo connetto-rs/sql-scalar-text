@@ -18,8 +18,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const CONTAINER_LABEL: &str = "io.sql-scalar-text.harness";
-pub const STARTED_LABEL: &str = "io.sql-scalar-text.harness.started";
+pub const CONTAINER_LABEL: &str = "io.sql-values.harness";
+pub const STARTED_LABEL: &str = "io.sql-values.harness.started";
 
 /// How old a labelled container must be before the sweep removes it. Longer
 /// than any test binary by a wide margin, because a sibling binary owns

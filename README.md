@@ -1,15 +1,15 @@
-# sql-scalar-text
+# sql-values
 
-[![crates.io](https://img.shields.io/crates/v/sql-scalar-text.svg)](https://crates.io/crates/sql-scalar-text)
-[![docs.rs](https://img.shields.io/docsrs/sql-scalar-text)](https://docs.rs/sql-scalar-text)
-[![CI](https://github.com/connetto-rs/sql-scalar-text/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/sql-scalar-text/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/connetto-rs/sql-scalar-text)
-[![license](https://img.shields.io/crates/l/sql-scalar-text.svg)](https://github.com/connetto-rs/sql-scalar-text/blob/main/LICENSE)
+[![crates.io](https://img.shields.io/crates/v/sql-values.svg)](https://crates.io/crates/sql-values)
+[![docs.rs](https://img.shields.io/docsrs/sql-values)](https://docs.rs/sql-values)
+[![CI](https://github.com/connetto-rs/sql-values/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/sql-values/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/connetto-rs/sql-values)
+[![license](https://img.shields.io/crates/l/sql-values.svg)](https://github.com/connetto-rs/sql-values/blob/main/LICENSE)
 
-`sql-scalar-text` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order and arithmetic), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value.
+`sql-values` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order and arithmetic), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value.
 
 ```rust
-use sql_scalar_text::{IntervalError, parse_bool, parse_interval, parse_timestamp};
+use sql_values::{IntervalError, parse_bool, parse_interval, parse_timestamp};
 
 assert_eq!(parse_bool("t"), Some(true));
 

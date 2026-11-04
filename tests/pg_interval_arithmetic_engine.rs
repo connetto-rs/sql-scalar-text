@@ -15,7 +15,7 @@ use diesel::{
     prelude::*,
     sql_types::{Array, Text},
 };
-use sql_scalar_text::{
+use sql_values::{
     IntervalSum, PgInterval, ShiftError, parse_f64, parse_interval, parse_time, parse_timestamp,
 };
 

@@ -25,7 +25,7 @@ use diesel::{
     sql_types::{Integer, Nullable, Text},
 };
 use interval_literals::LITERALS;
-use sql_scalar_text::{
+use sql_values::{
     IntervalError, IntervalFields, IntervalTypmod, PgInterval, parse_interval,
     parse_interval_typmod,
 };

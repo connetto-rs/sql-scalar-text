@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eu
 
-cd "$SRC/sql-scalar-text"
+cd "$SRC/sql-values"
 cargo fuzz build -O --debug-assertions --fuzz-dir fuzz
 
 targets=$(cargo fuzz list --fuzz-dir fuzz)

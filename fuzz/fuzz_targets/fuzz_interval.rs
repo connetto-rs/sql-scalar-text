@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sql_scalar_text::{
+use sql_values::{
     IntervalFields, IntervalTypmod, PgInterval, parse_interval, parse_interval_typmod,
 };
 

@@ -162,7 +162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "sql-scalar-text"
+name = "sql-values"
 version = "0.3.0"
 dependencies = [
  "bigdecimal",
@@ -171,13 +171,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "sql-scalar-text-fuzz"
+name = "sql-values-fuzz"
 version = "0.0.0"
 dependencies = [
  "bigdecimal",
  "chrono",
  "libfuzzer-sys",
- "sql-scalar-text",
+ "sql-values",
 ]
 
 [[package]]

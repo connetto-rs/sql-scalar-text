@@ -1,11 +1,11 @@
-use sql_scalar_text::{parse_bool, parse_f64, parse_i64, parse_pg_bytea_hex};
+use sql_values::{parse_bool, parse_f64, parse_i64, parse_pg_bytea_hex};
 
 #[cfg(feature = "decimal")]
 use bigdecimal::BigDecimal;
 #[cfg(feature = "decimal")]
 use core::str::FromStr;
 #[cfg(feature = "decimal")]
-use sql_scalar_text::parse_decimal;
+use sql_values::parse_decimal;
 
 #[test]
 fn parses_boolean_spelling_corpus_to_exact_values() {

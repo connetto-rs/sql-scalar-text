@@ -1,7 +1,7 @@
 use chrono::{Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use core::fmt::Write as _;
 use proptest::prelude::*;
-use sql_scalar_text::{
+use sql_values::{
     PgInterval, parse_bool, parse_date, parse_f64, parse_i64, parse_interval, parse_pg_bytea_hex,
     parse_time, parse_timestamp, parse_timestamp_tz,
 };
@@ -333,7 +333,7 @@ fn f64_corpus_idempotence() {
 #[cfg(feature = "decimal")]
 #[test]
 fn decimal_corpus_idempotence() {
-    use sql_scalar_text::parse_decimal;
+    use sql_values::parse_decimal;
 
     let corpus = ["0", "-1.5", "+1", "1e20", "12345678901234567890.123456789"];
     for &s in &corpus {

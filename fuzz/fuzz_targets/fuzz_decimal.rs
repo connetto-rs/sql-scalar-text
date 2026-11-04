@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use sql_scalar_text::parse_decimal;
+use sql_values::parse_decimal;
 
 /// Plain spellings grow with the scale and reparse in superlinear time, so wider values skip them.
 const MAX_PLAIN_SCALE: u64 = 1024;
