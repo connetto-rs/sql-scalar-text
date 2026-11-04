@@ -2,7 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use sql_scalar_text::{
+use sql_values::{
     parse_bool, parse_date, parse_pg_bytea_hex, parse_time, parse_timestamp, parse_timestamp_tz,
 };
 

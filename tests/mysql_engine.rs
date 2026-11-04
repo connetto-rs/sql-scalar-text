@@ -8,7 +8,7 @@ mod fractional_matrix;
 use chrono::{NaiveDate, NaiveTime};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use sql_scalar_text::{parse_bool, parse_date, parse_f64, parse_i64, parse_time, parse_timestamp};
+use sql_values::{parse_bool, parse_date, parse_f64, parse_i64, parse_time, parse_timestamp};
 use testcontainers::{
     GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -144,7 +144,7 @@ fn mysql_bool_cast_as_char() {
 fn mysql_decimal_beyond_f64_precision() {
     use bigdecimal::BigDecimal;
     use core::str::FromStr;
-    use sql_scalar_text::parse_decimal;
+    use sql_values::parse_decimal;
 
     let mut conn = mysql_conn();
 

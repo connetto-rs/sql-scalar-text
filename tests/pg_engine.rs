@@ -10,7 +10,7 @@ mod postgres;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use sql_scalar_text::{
+use sql_values::{
     parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex, parse_time, parse_timestamp,
     parse_timestamp_tz,
 };
@@ -179,7 +179,7 @@ fn pg_scalar_types() {
 fn pg_decimal_beyond_f64_precision() {
     use bigdecimal::BigDecimal;
     use core::str::FromStr;
-    use sql_scalar_text::parse_decimal;
+    use sql_values::parse_decimal;
 
     let mut conn = pg_conn();
     let expr = "'12345678901234567890.123456789'::numeric::text";

@@ -1,12 +1,12 @@
 [package]
-name = "sql-scalar-text"
+name = "sql-values"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Luca Cappelletti"]
 license = "MIT"
 description = "SQL values, with PostgreSQL's value rules beside readers of the text PostgreSQL, MySQL and SQLite emit"
-repository = "https://github.com/connetto-rs/sql-scalar-text"
+repository = "https://github.com/connetto-rs/sql-values"
 readme = "README.md"
 keywords = ["sql", "parser", "postgresql", "mysql", "sqlite"]
 categories = ["database", "parser-implementations", "no-std"]

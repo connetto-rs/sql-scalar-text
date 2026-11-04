@@ -1,7 +1,7 @@
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use sql_scalar_text::{parse_bool, parse_date, parse_f64, parse_i64, parse_time, parse_timestamp};
+use sql_values::{parse_bool, parse_date, parse_f64, parse_i64, parse_time, parse_timestamp};
 
 diesel::table! {
     scalars (id) {

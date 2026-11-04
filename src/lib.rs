@@ -17,7 +17,7 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZon
 /// and PostgreSQL's trailing ` BC`.
 ///
 /// ```
-/// let dt = sql_scalar_text::parse_timestamp("2024-01-02 03:04:05.125").unwrap();
+/// let dt = sql_values::parse_timestamp("2024-01-02 03:04:05.125").unwrap();
 /// assert_eq!(dt.format("%Y-%m-%d %H:%M:%S%.f").to_string(), "2024-01-02 03:04:05.125");
 /// ```
 pub fn parse_timestamp(text: &str) -> Option<NaiveDateTime> {
@@ -32,7 +32,7 @@ pub fn parse_timestamp(text: &str) -> Option<NaiveDateTime> {
 /// offset, then PostgreSQL's optional ` BC`.
 ///
 /// ```
-/// let dt = sql_scalar_text::parse_timestamp_tz("2024-01-02T03:04:05+02:00").unwrap();
+/// let dt = sql_values::parse_timestamp_tz("2024-01-02T03:04:05+02:00").unwrap();
 /// assert_eq!(dt.to_rfc3339(), "2024-01-02T01:04:05+00:00");
 /// ```
 pub fn parse_timestamp_tz(text: &str) -> Option<DateTime<Utc>> {
@@ -50,7 +50,7 @@ pub fn parse_timestamp_tz(text: &str) -> Option<DateTime<Utc>> {
 /// Parse a `YYYY-MM-DD` date with a year of four or more digits and PostgreSQL's trailing ` BC`.
 ///
 /// ```
-/// let d = sql_scalar_text::parse_date("2024-01-02").unwrap();
+/// let d = sql_values::parse_date("2024-01-02").unwrap();
 /// assert_eq!(d.to_string(), "2024-01-02");
 /// ```
 pub fn parse_date(text: &str) -> Option<NaiveDate> {
@@ -64,7 +64,7 @@ pub fn parse_date(text: &str) -> Option<NaiveDate> {
 /// Parse `HH:MM:SS[.f]` with one to nine fraction digits.
 ///
 /// ```
-/// let t = sql_scalar_text::parse_time("03:04:05.125").unwrap();
+/// let t = sql_values::parse_time("03:04:05.125").unwrap();
 /// assert_eq!(t.to_string(), "03:04:05.125");
 /// ```
 pub fn parse_time(text: &str) -> Option<NaiveTime> {
@@ -150,7 +150,7 @@ fn parse_datetime_prefix(bytes: &[u8], bc: bool) -> Option<(NaiveDateTime, &[u8]
 /// Parse `t`, `f`, `1`, or `0` as a boolean.
 ///
 /// ```
-/// assert_eq!(sql_scalar_text::parse_bool("0"), Some(false));
+/// assert_eq!(sql_values::parse_bool("0"), Some(false));
 /// ```
 pub fn parse_bool(text: &str) -> Option<bool> {
     match text {
@@ -163,7 +163,7 @@ pub fn parse_bool(text: &str) -> Option<bool> {
 /// Parse PostgreSQL `\x`-prefixed bytea hex with no intermediate allocation.
 ///
 /// ```
-/// assert_eq!(sql_scalar_text::parse_pg_bytea_hex(r"\x4869"), Some(vec![0x48, 0x69]));
+/// assert_eq!(sql_values::parse_pg_bytea_hex(r"\x4869"), Some(vec![0x48, 0x69]));
 /// ```
 pub fn parse_pg_bytea_hex(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
@@ -188,7 +188,7 @@ pub fn parse_pg_bytea_hex(text: &str) -> Option<Vec<u8>> {
 /// Parse integer text with an optional leading sign.
 ///
 /// ```
-/// assert_eq!(sql_scalar_text::parse_i64("-42"), Some(-42));
+/// assert_eq!(sql_values::parse_i64("-42"), Some(-42));
 /// ```
 pub fn parse_i64(text: &str) -> Option<i64> {
     text.parse::<i64>().ok()
@@ -197,7 +197,7 @@ pub fn parse_i64(text: &str) -> Option<i64> {
 /// Parse a 64-bit float, including PostgreSQL infinity and `NaN` spellings.
 ///
 /// ```
-/// assert_eq!(sql_scalar_text::parse_f64("Infinity"), Some(f64::INFINITY));
+/// assert_eq!(sql_values::parse_f64("Infinity"), Some(f64::INFINITY));
 /// ```
 pub fn parse_f64(text: &str) -> Option<f64> {
     match text {
@@ -211,7 +211,7 @@ pub fn parse_f64(text: &str) -> Option<f64> {
 /// Parse an arbitrary-precision decimal.
 ///
 /// ```
-/// let d = sql_scalar_text::parse_decimal("123.450").unwrap();
+/// let d = sql_values::parse_decimal("123.450").unwrap();
 /// assert_eq!(d.to_string(), "123.450");
 /// ```
 #[cfg(feature = "decimal")]

@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use sql_scalar_text::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
+use sql_values::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 
 #[derive(Debug)]
 enum Temporal {

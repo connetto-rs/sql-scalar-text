@@ -1,12 +1,12 @@
 use core::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use sql_scalar_text::{
+use sql_values::{
     parse_bool, parse_date, parse_f64, parse_i64, parse_interval, parse_pg_bytea_hex, parse_time,
     parse_timestamp, parse_timestamp_tz,
 };
 
 #[cfg(feature = "decimal")]
-use sql_scalar_text::parse_decimal;
+use sql_values::parse_decimal;
 
 fn timestamp_corpus() -> Vec<&'static str> {
     vec![

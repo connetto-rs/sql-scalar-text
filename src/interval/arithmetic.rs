@@ -86,7 +86,7 @@ impl PgInterval {
     /// opposite infinities meet.
     ///
     /// ```
-    /// use sql_scalar_text::{IntervalError, PgInterval, parse_interval};
+    /// use sql_values::{IntervalError, PgInterval, parse_interval};
     ///
     /// let day = parse_interval("1 day").unwrap();
     /// let hour = parse_interval("-01:00:00").unwrap();
@@ -136,7 +136,7 @@ impl PgInterval {
     /// infinity.
     ///
     /// ```
-    /// use sql_scalar_text::{IntervalError, parse_interval};
+    /// use sql_values::{IntervalError, parse_interval};
     ///
     /// let span = parse_interval("1 mon -2 days").unwrap();
     /// assert_eq!(span.checked_neg().unwrap().to_string(), "-1 mons +2 days");
@@ -166,7 +166,7 @@ impl PgInterval {
     /// factor against a zero interval, and a product beyond the type.
     ///
     /// ```
-    /// use sql_scalar_text::{IntervalError, PgInterval, parse_interval};
+    /// use sql_values::{IntervalError, PgInterval, parse_interval};
     ///
     /// let month = parse_interval("1 mon 1 day").unwrap();
     /// assert_eq!(month.checked_mul(1.5).unwrap().to_string(), "1 mon 16 days 12:00:00");
@@ -203,7 +203,7 @@ impl PgInterval {
     /// a `NaN` factor, an infinity divided by an infinity, and a quotient beyond the type.
     ///
     /// ```
-    /// use sql_scalar_text::{IntervalError, parse_interval};
+    /// use sql_values::{IntervalError, parse_interval};
     ///
     /// let span = parse_interval("1 mon 1 day 00:00:01").unwrap();
     /// assert_eq!(span.checked_div(7.0).unwrap().to_string(), "4 days 10:17:08.6896");
@@ -295,7 +295,7 @@ impl PgInterval {
     /// `-infinity` or a year past `chrono`'s.
     ///
     /// ```
-    /// use sql_scalar_text::{parse_interval, parse_timestamp};
+    /// use sql_values::{parse_interval, parse_timestamp};
     ///
     /// let at = parse_timestamp("2024-01-31 10:00:00").unwrap();
     /// let month = parse_interval("1 mon").unwrap();
@@ -359,7 +359,7 @@ impl PgInterval {
     /// [`ShiftError::TimestampOutOfRange`] where a timestamp lies outside PostgreSQL's.
     ///
     /// ```
-    /// use sql_scalar_text::{PgInterval, parse_timestamp};
+    /// use sql_values::{PgInterval, parse_timestamp};
     ///
     /// let later = parse_timestamp("2024-03-01 06:00:00").unwrap();
     /// let earlier = parse_timestamp("2024-02-28 12:00:00").unwrap();
@@ -393,7 +393,7 @@ impl PgInterval {
     /// [`ShiftError::InfiniteIntervalAddedToTime`] for an infinite interval.
     ///
     /// ```
-    /// use sql_scalar_text::{parse_interval, parse_time};
+    /// use sql_values::{parse_interval, parse_time};
     ///
     /// let at = parse_time("23:00:00").unwrap();
     /// let span = parse_interval("1 day 02:30:00").unwrap();
@@ -551,7 +551,7 @@ const fn days_in_month(year: i32, month: i32) -> i32 {
 /// either in is componentwise addition.
 ///
 /// ```
-/// use sql_scalar_text::{IntervalSum, PgInterval, parse_interval};
+/// use sql_values::{IntervalSum, PgInterval, parse_interval};
 ///
 /// let mut total = IntervalSum::default();
 /// for text in ["1 mon", "2 days", "-01:00:00"] {

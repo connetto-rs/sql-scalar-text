@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use sql_scalar_text::parse_timestamp;
+use sql_values::parse_timestamp;
 
 /// Assert each case's text parses as 2024-01-15 10:30:45 plus `frac_ns` nanoseconds.
 pub fn assert_fractional_seconds(cases: &[(&str, u32)], mut fetch: impl FnMut(&str) -> String) {

@@ -2259,7 +2259,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sql-scalar-text"
+name = "sql-values"
 version = "0.3.0"
 dependencies = [
  "bigdecimal",

@@ -25,7 +25,7 @@ const DAYS_PER_MONTH: i64 = 30;
 /// PostgreSQL's span with a month as 30 days and a day as 24 hours.
 ///
 /// ```
-/// use sql_scalar_text::{PgInterval, parse_interval};
+/// use sql_values::{PgInterval, parse_interval};
 ///
 /// let month = parse_interval("1 mon").unwrap();
 /// let thirty_days = parse_interval("30 days").unwrap();
@@ -63,7 +63,7 @@ impl PgInterval {
     /// Whether the interval is neither `infinity` nor `-infinity`.
     ///
     /// ```
-    /// use sql_scalar_text::PgInterval;
+    /// use sql_values::PgInterval;
     ///
     /// assert!(!PgInterval::INFINITY.is_finite());
     /// assert!(PgInterval { months: i32::MAX, days: i32::MAX, microseconds: 0 }.is_finite());
@@ -83,7 +83,7 @@ impl PgInterval {
     /// day as 24 hours, which orders, equates and hashes the interval.
     ///
     /// ```
-    /// use sql_scalar_text::parse_interval;
+    /// use sql_values::parse_interval;
     ///
     /// let month = parse_interval("1 mon -1 days").unwrap();
     /// assert_eq!(month.span_microseconds(), 29 * 86_400_000_000);
@@ -275,7 +275,7 @@ impl IntervalTypmod {
     /// precision after fields not ending in `SECOND`.
     ///
     /// ```
-    /// use sql_scalar_text::{IntervalFields, IntervalTypmod};
+    /// use sql_values::{IntervalFields, IntervalTypmod};
     ///
     /// assert!(IntervalTypmod::new(Some(IntervalFields::DayToSecond), Some(3)).is_some());
     /// assert!(IntervalTypmod::new(None, Some(3)).is_some());
@@ -310,7 +310,7 @@ impl IntervalTypmod {
 /// [`IntervalError::OutOfRange`] for years and months beyond the type.
 ///
 /// ```
-/// use sql_scalar_text::{IntervalError, PgInterval, parse_interval};
+/// use sql_values::{IntervalError, PgInterval, parse_interval};
 ///
 /// let interval = parse_interval("-1 days +02:00:00").unwrap();
 /// assert_eq!(
@@ -341,7 +341,7 @@ pub fn parse_interval(text: &str) -> Result<PgInterval, IntervalError> {
 /// seconds to the typmod's precision can also leave the type, [`IntervalError::OutOfRange`].
 ///
 /// ```
-/// use sql_scalar_text::{
+/// use sql_values::{
 ///     IntervalError, IntervalFields, IntervalTypmod, parse_interval, parse_interval_typmod,
 /// };
 ///
