@@ -3,6 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/sql-values.svg)](https://crates.io/crates/sql-values)
 [![docs.rs](https://img.shields.io/docsrs/sql-values)](https://docs.rs/sql-values)
 [![CI](https://github.com/connetto-rs/sql-values/actions/workflows/ci.yml/badge.svg)](https://github.com/connetto-rs/sql-values/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/connetto-rs/sql-values/branch/main/graph/badge.svg)](https://codecov.io/gh/connetto-rs/sql-values)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/connetto-rs/sql-values)
 [![license](https://img.shields.io/crates/l/sql-values.svg)](https://github.com/connetto-rs/sql-values/blob/main/LICENSE)
 
