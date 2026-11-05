@@ -808,7 +808,7 @@ fn write_timestamp(f: &mut fmt::Formatter<'_>, at: NaiveDateTime, zone: bool) ->
     let mut micros = time.nanosecond() / 1_000;
     if micros > 0 {
         let mut width = 6;
-        while micros % 10 == 0 {
+        while micros.is_multiple_of(10) {
             micros /= 10;
             width -= 1;
         }
