@@ -85,3 +85,10 @@ path = "fuzz_targets/fuzz_interval.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_cast"
+path = "fuzz_targets/fuzz_cast.rs"
+test = false
+doc = false
+bench = false

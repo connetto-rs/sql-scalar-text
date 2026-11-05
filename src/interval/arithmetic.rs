@@ -443,10 +443,19 @@ fn wrap_time(moved: i64) -> NaiveTime {
 }
 
 /// A timestamp as PostgreSQL holds it, microseconds from 2000-01-01.
-fn pg_timestamp(at: NaiveDateTime) -> Result<i64, ShiftError> {
+pub(crate) fn pg_timestamp(at: NaiveDateTime) -> Result<i64, ShiftError> {
+    valid_timestamp(pg_microseconds(at))
+}
+
+/// Microseconds from 2000-01-01 to `at`, which may lie outside PostgreSQL's range.
+pub(crate) fn pg_microseconds(at: NaiveDateTime) -> i64 {
     let days = i64::from(at.date().num_days_from_ce()) + JULIAN_BEFORE_CE - POSTGRES_EPOCH_JDATE;
     // `chrono` holds under 2^27 days either side, so the microseconds fit.
-    let timestamp = days * USECS_PER_DAY + pg_time(at.time());
+    days * USECS_PER_DAY + pg_time(at.time())
+}
+
+/// `IS_VALID_TIMESTAMP`.
+pub(crate) fn valid_timestamp(timestamp: i64) -> Result<i64, ShiftError> {
     if (MIN_TIMESTAMP..END_TIMESTAMP).contains(&timestamp) {
         Ok(timestamp)
     } else {
@@ -455,7 +464,7 @@ fn pg_timestamp(at: NaiveDateTime) -> Result<i64, ShiftError> {
 }
 
 /// The `chrono` timestamp of one PostgreSQL holds.
-fn chrono_timestamp(timestamp: i64) -> Result<NaiveDateTime, ShiftError> {
+pub(crate) fn chrono_timestamp(timestamp: i64) -> Result<NaiveDateTime, ShiftError> {
     let days = timestamp.div_euclid(USECS_PER_DAY) + POSTGRES_EPOCH_JDATE - JULIAN_BEFORE_CE;
     let date = i32::try_from(days)
         .ok()

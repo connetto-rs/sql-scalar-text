@@ -3,12 +3,16 @@
 
 extern crate alloc;
 
+mod cast;
 mod interval;
+mod numeric;
 
+pub use cast::{CastError, CastTarget, CastValue, CharLength, Literal, PgType, cast_literal};
 pub use interval::{
     IntervalError, IntervalFields, IntervalSum, IntervalTypmod, PgInterval, ShiftError,
     parse_interval, parse_interval_typmod,
 };
+pub use numeric::{NumericTypmod, PgNumeric};
 
 use alloc::vec::Vec;
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
