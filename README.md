@@ -34,4 +34,4 @@ let level = cast_literal(Literal::Number("2.7"), CastTarget::Integer).unwrap();
 assert_eq!(level.to_string(), "3");
 ```
 
-The crate supports `no_std`. Decimal parsing is available through the `decimal` feature, and `serde` derives for interval, date and time values through the `serde` feature.
+The crate supports `no_std`. Decimal parsing is available through the `decimal` feature, conversions to and from jiff's date and time types through the `jiff` feature, and `serde` derives for interval, date and time values through the `serde` feature.
