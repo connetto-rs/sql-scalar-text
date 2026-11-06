@@ -34,7 +34,7 @@ pub(crate) const END_TIMESTAMP: i64 = 9_223_371_331_200_000_000;
 const TZDISP_LIMIT: i32 = 16 * 3_600;
 
 /// Why PostgreSQL refuses a date or time, one variant per message it raises, or why this crate
-/// declines to answer for it.
+/// cannot answer for it without more session state or a wider zone database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum DateTimeError {
     /// A year, month, day, hour, minute or second no calendar or clock has.
@@ -71,11 +71,6 @@ pub enum DateTimeError {
     /// [`InputContext`].
     #[error("the literal needs the current time")]
     NeedsCurrentTime,
-    /// A `time` or `timetz` spelling this crate does not model. Those readers take
-    /// `HH:MM[:SS[.f]][offset]` followed by a zone abbreviation or all-letter zone name, and
-    /// `allballs`.
-    #[error("date/time spelling not modelled")]
-    Unsupported,
 }
 
 /// A PostgreSQL `date`, days from 2000-01-01, from 4714-11-24 BC to 5874897-12-31 and the two
