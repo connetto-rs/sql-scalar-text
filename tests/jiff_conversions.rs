@@ -102,7 +102,12 @@ fn instants_convert_within_jiff_range() {
     }
     let epoch = PgTimestampTz::parse("1970-01-01 00:00:00+00", context).unwrap();
     assert_eq!(Timestamp::try_from(epoch), Ok(Timestamp::UNIX_EPOCH));
-    for text in ["10000-01-01 00:00:00+00", "infinity", "-infinity"] {
+    for text in [
+        "10000-01-01 00:00:00+00",
+        "294276-12-31 23:59:59.999999+00",
+        "infinity",
+        "-infinity",
+    ] {
         let at = PgTimestampTz::parse(text, context).unwrap();
         assert_eq!(
             Timestamp::try_from(at),

@@ -515,8 +515,8 @@ fn shifts_in_an_iana_zone_refuse_past_jiff_years() {
     );
 }
 
-/// `sum` and `avg` of every group, folded in and also folded with an infinity and a total near a
-/// field's minimum that then leave again.
+/// `sum` and `avg` of every group, folded in and also folded with an infinity, a total near a
+/// field's minimum and row counts past `i64` that then leave again.
 #[test]
 fn pg18_sums_and_averages_every_group() {
     let mut conn = connect();
@@ -541,6 +541,11 @@ fn pg18_sums_and_averages_every_group() {
                 interval("-178956970 years -8 mons"),
                 weight,
             ));
+        }
+        // Weights whose running total passes `i64`, which then leave again.
+        for weight in [i64::MAX, i64::MAX, -i64::MAX, -i64::MAX] {
+            churned.merge(IntervalSum::of(interval("1 day"), weight));
+            churned.merge(IntervalSum::of(PgInterval::INFINITY, weight));
         }
         for (aggregate, got) in [
             ("sum", total.sum()),

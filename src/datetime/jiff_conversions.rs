@@ -133,8 +133,10 @@ impl TryFrom<PgTimestampTz> for Timestamp {
         if !at.is_finite() {
             return Err(DateTimeError::OutsideJiffRange);
         }
-        Self::from_microsecond(at.0 + UNIX_TO_POSTGRES_MICROS)
-            .map_err(|_| DateTimeError::OutsideJiffRange)
+        // The last years of PostgreSQL's range pass `i64` as microseconds from 1970.
+        at.0.checked_add(UNIX_TO_POSTGRES_MICROS)
+            .and_then(|micros| Self::from_microsecond(micros).ok())
+            .ok_or(DateTimeError::OutsideJiffRange)
     }
 }
 

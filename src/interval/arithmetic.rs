@@ -552,9 +552,10 @@ fn wrap_time(moved: i64) -> PgTime {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct IntervalSum {
-    finite: i64,
-    positive_infinities: i64,
-    negative_infinities: i64,
+    // Row counts in `i128` as the sums are, so that no run of `i64` weights overflows them.
+    finite: i128,
+    positive_infinities: i128,
+    negative_infinities: i128,
     months: i128,
     days: i128,
     microseconds: i128,
@@ -565,31 +566,38 @@ impl IntervalSum {
     /// leaving.
     #[must_use]
     pub fn of(value: PgInterval, weight: i64) -> Self {
+        let wide = i128::from(weight);
         match value.infinity() {
             Some(Ordering::Greater) => Self {
-                positive_infinities: weight,
+                positive_infinities: wide,
                 ..Self::default()
             },
             Some(_) => Self {
-                negative_infinities: weight,
+                negative_infinities: wide,
                 ..Self::default()
             },
-            None => {
-                let wide = i128::from(weight);
-                Self {
-                    finite: weight,
-                    positive_infinities: 0,
-                    negative_infinities: 0,
-                    months: i128::from(value.months) * wide,
-                    days: i128::from(value.days) * wide,
-                    microseconds: i128::from(value.microseconds) * wide,
-                }
-            }
+            None => Self {
+                finite: wide,
+                positive_infinities: 0,
+                negative_infinities: 0,
+                months: i128::from(value.months) * wide,
+                days: i128::from(value.days) * wide,
+                microseconds: i128::from(value.microseconds) * wide,
+            },
         }
     }
 
     /// The state a database reports for some rows: the sum of the finite ones, how many there
     /// are, and how many are each infinity.
+    ///
+    /// ```
+    /// use sql_values::{IntervalSum, parse_interval};
+    ///
+    /// let mut state = IntervalSum::seeded(Some(parse_interval("3 days").unwrap()), 2, 0, 0);
+    /// assert_eq!(state.count(), 2);
+    /// state.merge(IntervalSum::of(parse_interval("3 days").unwrap(), 1));
+    /// assert_eq!(state.avg().unwrap().unwrap().to_string(), "2 days");
+    /// ```
     #[must_use]
     pub fn seeded(
         finite_sum: Option<PgInterval>,
@@ -600,9 +608,9 @@ impl IntervalSum {
         let (months, days, microseconds) =
             finite_sum.map_or((0, 0, 0), |sum| (sum.months, sum.days, sum.microseconds));
         Self {
-            finite,
-            positive_infinities,
-            negative_infinities,
+            finite: i128::from(finite),
+            positive_infinities: i128::from(positive_infinities),
+            negative_infinities: i128::from(negative_infinities),
             months: i128::from(months),
             days: i128::from(days),
             microseconds: i128::from(microseconds),
@@ -627,7 +635,7 @@ impl IntervalSum {
 
     /// The rows folded in.
     #[must_use]
-    pub const fn count(&self) -> i64 {
+    pub const fn count(&self) -> i128 {
         self.finite + self.positive_infinities + self.negative_infinities
     }
 
