@@ -1378,13 +1378,18 @@ fn hex_to_f64(mantissa: u64, exponent: i64, sticky: bool) -> f64 {
         let dropped = mantissa & ((1_u64 << excess) - 1);
         let half = 1_u64 << (excess - 1);
         let round_up = dropped > half || (dropped == half && (sticky || kept & 1 == 1));
-        (kept + u64::from(round_up), exponent + i64::from(excess))
+        // A `p` exponent near the end of `i64` saturates, since any such scale overflows or
+        // underflows a double alike.
+        (
+            kept + u64::from(round_up),
+            exponent.saturating_add(i64::from(excess)),
+        )
     } else {
         (mantissa, exponent)
     };
     if significand >> 53 != 0 {
         significand >>= 1;
-        scale += 1;
+        scale = scale.saturating_add(1);
     }
     debug_assert!(
         significand >> 53 == 0,
