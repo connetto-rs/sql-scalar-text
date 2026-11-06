@@ -1,6 +1,8 @@
 //! The date and time types' bounds, conversions from what PostgreSQL stores, and order.
 
-use sql_values::{DateTimeError, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz};
+use std::collections::HashSet;
+
+use sql_values::{DateTimeError, PgDate, PgTime, PgTimeTz, PgTimeZone, PgTimestamp, PgTimestampTz};
 
 /// 4714-11-24 BC and 5874897-12-31, in days from 2000-01-01.
 const FIRST_DAY: i32 = -2_451_545;
@@ -174,4 +176,19 @@ fn timestamptz_holds_postgresql_range_and_prints_at_utc() {
     assert_eq!(PgTimestampTz::INFINITY.to_string(), "infinity");
     assert!(PgTimestampTz::NEG_INFINITY < first && !PgTimestampTz::NEG_INFINITY.is_finite());
     assert!(!PgTimestampTz::INFINITY.is_finite() && last.is_finite());
+}
+
+/// Zones are equal when `SHOW timezone` names them alike, whatever the spelling they were read
+/// from.
+#[test]
+fn time_zones_equal_by_canonical_name() {
+    let zone =
+        |setting| PgTimeZone::parse(setting).unwrap_or_else(|error| panic!("{setting}: {error}"));
+    assert_eq!(zone("europe/rome"), zone("Europe/Rome"));
+    assert_eq!(zone("+2"), zone("02"));
+    assert_eq!(zone("abc3"), zone("ABC3"));
+    assert_ne!(zone("Europe/Rome"), zone("Europe/Paris"));
+    assert_ne!(zone("+02"), zone("UTC-2"));
+    let zones: HashSet<PgTimeZone> = ["Europe/Rome", "EUROPE/ROME", "+02", "2"].map(zone).into();
+    assert_eq!(zones.len(), 2);
 }

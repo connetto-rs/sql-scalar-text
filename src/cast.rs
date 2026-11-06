@@ -5,7 +5,7 @@ use alloc::string::{String, ToString};
 use core::fmt;
 
 use crate::{
-    datetime::{DateTimeError, PgDate, PgTimestamp, PgTimestampTz},
+    datetime::{DateTimeError, InputContext, PgDate, PgTimestamp, PgTimestampTz},
     numeric::{NumericTypmod, PgNumeric},
 };
 
@@ -471,16 +471,16 @@ fn cast_quoted(text: &str, target: CastTarget) -> Result<CastValue, CastError> {
         CastTarget::Text | CastTarget::Varchar(_) | CastTarget::Bpchar(_) => {
             Ok(character(text, target))
         }
-        CastTarget::Date => PgDate::parse(text)
+        CastTarget::Date => PgDate::parse(text, InputContext::new())
             .map(CastValue::Date)
             .map_err(datetime_error),
         CastTarget::Timestamp(precision) => {
-            let at = PgTimestamp::parse(text).map_err(datetime_error)?;
+            let at = PgTimestamp::parse(text, InputContext::new()).map_err(datetime_error)?;
             let micros = adjust_timestamp_for_typmod(at.pg_micros(), precision);
             Ok(CastValue::Timestamp(PgTimestamp::from_stored(micros)))
         }
         CastTarget::TimestampTz(precision) => {
-            let at = PgTimestampTz::parse(text).map_err(datetime_error)?;
+            let at = PgTimestampTz::parse(text, InputContext::new()).map_err(datetime_error)?;
             let micros = adjust_timestamp_for_typmod(at.pg_micros(), precision);
             Ok(CastValue::TimestampTz(PgTimestampTz::from_stored(micros)))
         }
@@ -660,7 +660,9 @@ fn datetime_error(error: DateTimeError) -> CastError {
         DateTimeError::TimeZoneDisplacementOutOfRange => CastError::TimeZoneDisplacementOutOfRange,
         DateTimeError::DateOutOfRange => CastError::DateOutOfRange,
         DateTimeError::TimestampOutOfRange => CastError::TimestampOutOfRange,
-        DateTimeError::NeedsTimeZone | DateTimeError::Unsupported => CastError::Unsupported,
+        DateTimeError::OutsideJiffRange
+        | DateTimeError::NeedsTimeZone
+        | DateTimeError::Unsupported => CastError::Unsupported,
     }
 }
 

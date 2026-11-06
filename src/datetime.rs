@@ -1,11 +1,14 @@
 //! PostgreSQL 18's `date`, `time`, `timetz`, `timestamp` and `timestamptz`, held as PostgreSQL
-//! stores them and printed by their output functions under `DateStyle` `ISO`.
+//! stores them, printed by their output functions under `DateStyle` `ISO`, and converted into one
+//! another in a [`PgTimeZone`].
 
 mod input;
 
 use core::{cmp::Ordering, fmt};
 
-pub use input::{parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
+pub use input::{InputContext, parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
+
+use crate::PgTimeZone;
 
 pub(crate) const USECS_PER_SEC: i64 = 1_000_000;
 pub(crate) const USECS_PER_MINUTE: i64 = 60_000_000;
@@ -14,6 +17,8 @@ pub(crate) const USECS_PER_DAY: i64 = 86_400_000_000;
 pub(crate) const MONTHS_PER_YEAR: i32 = 12;
 /// `POSTGRES_EPOCH_JDATE`, the Julian day of 2000-01-01.
 pub(crate) const POSTGRES_EPOCH_JDATE: i32 = 2_451_545;
+/// Seconds from 1970-01-01, `UNIX_EPOCH_JDATE`, to 2000-01-01.
+const UNIX_TO_POSTGRES_SECS: i64 = 946_684_800;
 /// `DATE_END_JULIAN`, the Julian day of 5874898-01-01, past the last date.
 const DATE_END_JULIAN: i32 = 2_147_483_494;
 /// `MIN_TIMESTAMP`, 4714-11-24 00:00:00 BC.
@@ -39,8 +44,12 @@ pub enum DateTimeError {
     /// A timestamp before 4714-11-24 BC or from 294277-01-01.
     #[error("timestamp out of range")]
     TimestampOutOfRange,
-    /// A literal without an offset read as a `timestamptz`, whose instant the session's
-    /// `TimeZone` decides.
+    /// A value outside jiff's years -9999 to 9999, an infinity included, where jiff's types or
+    /// its time zone database are needed.
+    #[error("value outside jiff's years -9999 to 9999")]
+    OutsideJiffRange,
+    /// A literal without an offset read as a `timestamptz` with no time zone in the
+    /// [`InputContext`].
     #[error("the literal needs a time zone to read as timestamp with time zone")]
     NeedsTimeZone,
     /// A spelling this crate does not model. The readers take the ISO spelling
@@ -54,11 +63,11 @@ pub enum DateTimeError {
 /// infinities, ordered as PostgreSQL orders it.
 ///
 /// ```
-/// use sql_values::PgDate;
+/// use sql_values::{InputContext, PgDate};
 ///
 /// let leap = PgDate::from_ymd(2024, 2, 29).unwrap();
 /// assert_eq!(leap.to_string(), "2024-02-29");
-/// assert_eq!(PgDate::parse("2024-02-29"), Ok(leap));
+/// assert_eq!(PgDate::parse("2024-02-29", InputContext::new()), Ok(leap));
 /// assert_eq!(PgDate::from_ymd(-4713, 11, 24).unwrap().to_string(), "4714-11-24 BC");
 /// assert!(PgDate::from_ymd(-4713, 11, 23).is_none());
 /// assert!(PgDate::NEG_INFINITY < leap && leap < PgDate::INFINITY);
@@ -114,9 +123,9 @@ pub struct PgTimeTz {
 /// 294276-12-31 23:59:59.999999 and the two infinities.
 ///
 /// ```
-/// use sql_values::PgTimestamp;
+/// use sql_values::{InputContext, PgTimestamp};
 ///
-/// let last = PgTimestamp::parse("294276-12-31 23:59:59.999999").unwrap();
+/// let last = PgTimestamp::parse("294276-12-31 23:59:59.999999", InputContext::new()).unwrap();
 /// assert_eq!(last.to_string(), "294276-12-31 23:59:59.999999");
 /// assert_eq!(PgTimestamp::INFINITY.to_string(), "infinity");
 /// assert!(last < PgTimestamp::INFINITY);
@@ -133,9 +142,9 @@ pub struct PgTimestamp(i64);
 /// range of [`PgTimestamp`], printed as under `TimeZone` `UTC`.
 ///
 /// ```
-/// use sql_values::PgTimestampTz;
+/// use sql_values::{InputContext, PgTimestampTz};
 ///
-/// let at = PgTimestampTz::parse("2026-03-29 12:00:00+02").unwrap();
+/// let at = PgTimestampTz::parse("2026-03-29 12:00:00+02", InputContext::new()).unwrap();
 /// assert_eq!(at.to_string(), "2026-03-29 10:00:00+00");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -385,6 +394,36 @@ impl PgTimestamp {
             None
         }
     }
+
+    /// PostgreSQL's `timestamp::timestamptz` with `zone` as the session's `TimeZone`, the local
+    /// clock resolved by `DetermineTimeZoneOffset`. A clock the spring-forward gap skips takes
+    /// the offset before the change, and a clock the fall-back repeats the offset after it.
+    ///
+    /// # Errors
+    ///
+    /// [`DateTimeError::TimestampOutOfRange`] where the instant leaves PostgreSQL's range, and
+    /// [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about a clock outside
+    /// jiff's years.
+    ///
+    /// ```
+    /// use sql_values::{InputContext, PgTimeZone, PgTimestamp};
+    ///
+    /// let rome = PgTimeZone::parse("Europe/Rome").unwrap();
+    /// let gap = PgTimestamp::parse("2026-03-29 02:30:00", InputContext::new()).unwrap();
+    /// assert_eq!(gap.to_timestamptz(&rome).unwrap().to_string(), "2026-03-29 01:30:00+00");
+    /// ```
+    pub fn to_timestamptz(self, zone: &PgTimeZone) -> Result<PgTimestampTz, DateTimeError> {
+        if !self.is_finite() {
+            return Ok(PgTimestampTz(self.0));
+        }
+        let offset = local_offset(zone, self.0)?;
+        let instant = self.0 - i64::from(offset) * USECS_PER_SEC;
+        if is_valid_timestamp(instant) {
+            Ok(PgTimestampTz(instant))
+        } else {
+            Err(DateTimeError::TimestampOutOfRange)
+        }
+    }
 }
 
 impl PgTimestampTz {
@@ -420,6 +459,76 @@ impl PgTimestampTz {
     pub const fn is_finite(self) -> bool {
         self.0 != i64::MAX && self.0 != i64::MIN
     }
+
+    /// PostgreSQL's `timestamptz::timestamp` with `zone` as the session's `TimeZone`, the local
+    /// clock of the instant.
+    ///
+    /// # Errors
+    ///
+    /// [`DateTimeError::TimestampOutOfRange`] where the local clock leaves PostgreSQL's range,
+    /// and [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about an instant
+    /// outside jiff's years.
+    ///
+    /// ```
+    /// use sql_values::{InputContext, PgTimeZone, PgTimestampTz};
+    ///
+    /// let sydney = PgTimeZone::parse("Australia/Sydney").unwrap();
+    /// let at = PgTimestampTz::parse("2026-01-01 00:00:00+00", InputContext::new()).unwrap();
+    /// assert_eq!(at.to_timestamp(&sydney).unwrap().to_string(), "2026-01-01 11:00:00");
+    /// ```
+    pub fn to_timestamp(self, zone: &PgTimeZone) -> Result<PgTimestamp, DateTimeError> {
+        if !self.is_finite() {
+            return Ok(PgTimestamp(self.0));
+        }
+        let local = self.0 + i64::from(utc_offset(zone, self.0)?) * USECS_PER_SEC;
+        if is_valid_timestamp(local) {
+            Ok(PgTimestamp(local))
+        } else {
+            Err(DateTimeError::TimestampOutOfRange)
+        }
+    }
+
+    /// PostgreSQL's `timestamptz::date` with `zone` as the session's `TimeZone`, the local date
+    /// of the instant, which PostgreSQL does not range-check.
+    ///
+    /// # Errors
+    ///
+    /// [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about an instant outside
+    /// jiff's years.
+    pub fn to_date(self, zone: &PgTimeZone) -> Result<PgDate, DateTimeError> {
+        match self.0 {
+            i64::MAX => Ok(PgDate::INFINITY),
+            i64::MIN => Ok(PgDate::NEG_INFINITY),
+            utc => {
+                let local = utc + i64::from(utc_offset(zone, utc)?) * USECS_PER_SEC;
+                Ok(PgDate(narrow_days(local.div_euclid(USECS_PER_DAY))))
+            }
+        }
+    }
+}
+
+/// The offset `zone` has at the instant `utc`, microseconds from 2000-01-01 UTC, as
+/// `timestamp2tm` asks `pg_localtime` for it.
+pub(crate) fn utc_offset(zone: &PgTimeZone, utc: i64) -> Result<i32, DateTimeError> {
+    let unix = utc.div_euclid(USECS_PER_SEC) + UNIX_TO_POSTGRES_SECS;
+    zone.utc_offset(unix).ok_or(DateTimeError::OutsideJiffRange)
+}
+
+/// The offset `DetermineTimeZoneOffset` gives the local clock `local`, microseconds from
+/// 2000-01-01, in `zone`. A clock jiff cannot place that lies further past PostgreSQL's range
+/// than any of jiff's offsets reaches is [`DateTimeError::TimestampOutOfRange`], as PostgreSQL
+/// finds it after the offset.
+pub(crate) fn local_offset(zone: &PgTimeZone, local: i64) -> Result<i32, DateTimeError> {
+    /// jiff's offsets lie within 25:59:59 of UTC.
+    const JIFF_OFFSET_LIMIT: i64 = 26 * USECS_PER_HOUR;
+    let unix = local.div_euclid(USECS_PER_SEC) + UNIX_TO_POSTGRES_SECS;
+    zone.local_offset(unix).ok_or(
+        if (MIN_TIMESTAMP - JIFF_OFFSET_LIMIT..END_TIMESTAMP + JIFF_OFFSET_LIMIT).contains(&local) {
+            DateTimeError::OutsideJiffRange
+        } else {
+            DateTimeError::TimestampOutOfRange
+        },
+    )
 }
 
 /// `IS_VALID_TIMESTAMP`.

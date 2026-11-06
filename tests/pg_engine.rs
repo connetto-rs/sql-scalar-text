@@ -9,8 +9,9 @@ mod postgres;
 
 use diesel::{dsl::sql, prelude::*, result::Error as DieselError, sql_types::Text};
 use sql_values::{
-    DateTimeError, PgDate, PgTime, PgTimeTz, parse_bool, parse_date, parse_f64, parse_i64,
-    parse_pg_bytea_hex, parse_time, parse_timestamp, parse_timestamp_tz,
+    DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimeZone, PgTimestamp, PgTimestampTz,
+    parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex, parse_time, parse_timestamp,
+    parse_timestamp_tz,
 };
 
 /// One container per test binary, removed when the binary exits; a plain
@@ -119,9 +120,9 @@ fn pg18_reads_every_time_literal() {
     for &text in TIMES {
         cases.push((
             format!("{}::time", quoted(text)),
-            worded(PgTime::parse(text)),
+            worded(PgTime::parse(text, InputContext::new())),
         ));
-        let timetz = PgTimeTz::parse(text);
+        let timetz = PgTimeTz::parse(text, InputContext::new());
         if timetz != Err(DateTimeError::Unsupported) {
             cases.push((format!("{}::timetz", quoted(text)), worded(timetz)));
         }
@@ -135,7 +136,7 @@ fn pg18_orders_every_timetz_pair() {
     let mut conn = pg18_conn();
     let values: Vec<(&str, PgTimeTz)> = TIMES
         .iter()
-        .filter_map(|&text| Some((text, PgTimeTz::parse(text).ok()?)))
+        .filter_map(|&text| Some((text, PgTimeTz::parse(text, InputContext::new()).ok()?)))
         .collect();
     let mut cases = Vec::new();
     for &(left, left_value) in &values {
@@ -153,6 +154,277 @@ fn pg18_orders_every_timetz_pair() {
         }
     }
     assert_answers(&mut conn, cases);
+}
+
+/// Zones PostgreSQL's `TimeZone` names: daylight saving in the north and in the south, a zone
+/// that dropped it, fixed offsets in both sign conventions, and POSIX rules with and without a
+/// rule given.
+const ZONES: &[&str] = &[
+    "UTC",
+    "Europe/Rome",
+    "Australia/Sydney",
+    "America/Sao_Paulo",
+    "America/New_York",
+    "Asia/Kolkata",
+    "+02",
+    "-03:30",
+    "EST5EDT,M3.2.0,M11.1.0",
+    "XXX3YYY",
+    "<-03>3<-02>,M10.1.0/0,M2.3.0/0",
+    "ABC3DEF,J60/2,J60/3",
+];
+
+/// The zones of [`ZONES`] that need no time zone database, and so hold over PostgreSQL's whole
+/// range.
+const RULE_ZONES: &[&str] = &[
+    "UTC",
+    "+02",
+    "-03:30",
+    "EST5EDT,M3.2.0,M11.1.0",
+    "XXX3YYY",
+    "<-03>3<-02>,M10.1.0/0,M2.3.0/0",
+    "ABC3DEF,J60/2,J60/3",
+];
+
+/// Local clocks in each zone's 2026 gaps and overlaps, on either side of them, at local mean
+/// time, and at PostgreSQL's first instant.
+const LOCAL_CLOCKS: &[&str] = &[
+    "2026-03-29 01:59:59",
+    "2026-03-29 02:00:00",
+    "2026-03-29 02:30:00",
+    "2026-03-29 03:00:00",
+    "2026-10-25 01:59:59.999999",
+    "2026-10-25 02:00:00",
+    "2026-10-25 02:30:00",
+    "2026-10-25 03:00:00",
+    "2026-04-05 02:30:00",
+    "2026-04-05 03:00:00",
+    "2026-10-04 02:30:00",
+    "2026-03-08 02:30:00",
+    "2026-11-01 01:30:00",
+    "1850-01-01 00:00:00",
+    "4714-11-24 00:00:00 BC",
+    "4714-11-24 23:59:59 BC",
+    "4714-10-31 23:00:00 BC",
+    "2026-07-01 12:00:00",
+    "2026-10-04 00:30:00",
+    "2026-02-15 00:30:00",
+];
+
+/// Instants around each zone's 2026 changes, at local mean time, and at both ends of
+/// PostgreSQL's range.
+const INSTANTS: &[&str] = &[
+    "2026-03-29 00:59:59+00",
+    "2026-03-29 01:00:00+00",
+    "2026-10-25 00:30:00+00",
+    "2026-10-25 01:30:00+00",
+    "2026-04-04 15:30:00+00",
+    "2026-10-03 16:00:00+00",
+    "2026-03-08 06:59:59+00",
+    "2026-03-08 07:00:00+00",
+    "1850-01-01 00:00:00+00",
+    "4714-11-24 00:00:00+00 BC",
+    "4714-11-24 03:00:00+00 BC",
+    "infinity",
+    "-infinity",
+];
+
+/// Instants and clocks past jiff's years, which only the zones that need no database read.
+const FAR: &[&str] = &[
+    "294276-12-31 23:59:59+00",
+    "294276-12-31 22:00:00+00",
+    "200000-06-15 12:00:00+00",
+];
+
+/// Each zone with the crate's value for it.
+fn zones() -> Vec<(&'static str, PgTimeZone)> {
+    ZONES
+        .iter()
+        .map(|&name| {
+            let zone = PgTimeZone::parse(name).unwrap_or_else(|error| panic!("{name:?}: {error}"));
+            (name, zone)
+        })
+        .collect()
+}
+
+#[test]
+fn pg18_reads_local_timestamptz_in_each_zone() {
+    let mut conn = pg18_conn();
+    let utc = PgTimeZone::parse("UTC").expect("UTC");
+    for (name, zone) in zones() {
+        set_timezone(&mut conn, name);
+        let far: Vec<String> = if RULE_ZONES.contains(&name) {
+            FAR.iter()
+                .map(|at| at.trim_end_matches("+00").to_owned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut cases = Vec::new();
+        for text in LOCAL_CLOCKS.iter().map(|&at| at.to_owned()).chain(far) {
+            let context = InputContext::new().with_time_zone(&zone);
+            let got = PgTimestampTz::parse(&text, context).and_then(|at| at.to_timestamp(&utc));
+            cases.push((
+                format!("({}::timestamptz AT TIME ZONE 'UTC')", quoted(&text)),
+                worded(got),
+            ));
+        }
+        assert_answers(&mut conn, cases);
+    }
+}
+
+#[test]
+fn pg18_converts_between_timestamp_timestamptz_and_date_in_each_zone() {
+    let mut conn = pg18_conn();
+    let utc = PgTimeZone::parse("UTC").expect("UTC");
+    for (name, zone) in zones() {
+        set_timezone(&mut conn, name);
+        let far: &[&str] = if RULE_ZONES.contains(&name) { FAR } else { &[] };
+        let mut cases = Vec::new();
+        for &text in INSTANTS.iter().chain(far) {
+            let at = PgTimestampTz::parse(text, InputContext::new())
+                .unwrap_or_else(|error| panic!("{text:?}: {error}"));
+            cases.push((
+                format!("{}::timestamptz::timestamp", quoted(text)),
+                worded(at.to_timestamp(&zone)),
+            ));
+            cases.push((
+                format!("{}::timestamptz::date", quoted(text)),
+                worded(at.to_date(&zone)),
+            ));
+            let local = text.trim_end_matches("+00").replace("+00 BC", " BC");
+            let clock = PgTimestamp::parse(&local, InputContext::new())
+                .unwrap_or_else(|error| panic!("{local:?}: {error}"));
+            cases.push((
+                format!(
+                    "({}::timestamp::timestamptz AT TIME ZONE 'UTC')",
+                    quoted(&local)
+                ),
+                worded(
+                    clock
+                        .to_timestamptz(&zone)
+                        .and_then(|at| at.to_timestamp(&utc)),
+                ),
+            ));
+        }
+        assert_answers(&mut conn, cases);
+    }
+}
+
+/// `TimeZone` settings at each branch of `check_timezone`, with the Debian image's legacy links
+/// left out, since its tzdata omits them.
+const SETTINGS: &[&str] = &[
+    "UTC",
+    "utc",
+    "Etc/UTC",
+    "GMT",
+    "Europe/Rome",
+    "europe/rome",
+    "EUROPE/ROME",
+    "Asia/Kolkata",
+    "PST8PDT",
+    "EST5EDT",
+    "+02",
+    "-02",
+    "+2",
+    "02",
+    "2.5",
+    "1e1",
+    "0x10",
+    " +02",
+    "+15",
+    "+167",
+    "+168",
+    "200",
+    "-0",
+    "inf",
+    "nan",
+    "+02:00",
+    "+14:30",
+    "UTC+2",
+    "UTC-2",
+    "UTC0",
+    "JST-9",
+    "GMT-14",
+    "Etc/GMT-14",
+    "<+02>-2",
+    "<+02>-2<+03>",
+    "<+02>",
+    "A",
+    "AB3",
+    "ABC3",
+    "abc3",
+    "ABC-30",
+    "ABC25",
+    "ABC167",
+    "ABC168",
+    "ABC3:00:01",
+    "ABC+24:59:59",
+    "XXX3YYY",
+    "XXX3",
+    "ABC3DEF,J60,J300",
+    "ABC3DEF,60,300",
+    "ABC3DEF4,M3.5.0/26,M10.5.0",
+    "ABC3DEF4,M3.5.0/-170,M10.5.0",
+    "ABC3DEF4,M3.5.0/168,M10.5.0",
+    "EST5EDT,M3.2.0",
+    "<-03>3<-02>,M3.5.0/-2,M10.5.0/-1",
+    "interval '+02:00'",
+    "interval '-01:30:15'",
+    "interval '1 day'",
+    "interval '1 mon'",
+    "interval '167:59:59'",
+    "interval '168:00:00'",
+    "interval 'abc'",
+    "interval '+02:00",
+    "+-5",
+    "ABC+",
+    "ABC3DEF,Mx",
+    "ABC3DEF,M3,M10.5.0",
+    "ABC3DEF,M3.2,M11.1.0",
+    "ABC3DEF,M3.2.0",
+    "ABC3DEF,M3.2.0,M11.1.0x",
+    "ABC3DEF4;M3.2.0,M11.1.0",
+    "ABC3DEF,0/0,365/26",
+    "ABC3DEF,J60/2,J60/3",
+    "ABC3+4",
+    "ABC3<>",
+    "ABC3DEF4X",
+    ":UTC",
+    ":Europe/Rome",
+    ":foo",
+    ":ABC3",
+    "::UTC",
+    "foo",
+    "foo bar",
+    "",
+];
+
+#[test]
+fn pg18_reads_every_time_zone_setting() {
+    let mut conn = pg18_conn();
+    let too_long = "A".repeat(256) + "3";
+    let mismatches: Vec<String> = SETTINGS
+        .iter()
+        .copied()
+        .chain([too_long.as_str()])
+        .filter_map(|setting| {
+            // Raw SQL: `set_config` reports the GUC's refusal, and `SHOW` its canonical name.
+            let expected = diesel::select(sql::<Text>(&format!(
+                "set_config('TimeZone', {}, true) || '|' || current_setting('TimeZone')",
+                quoted(setting)
+            )))
+            .get_result::<String>(&mut conn)
+            .ok()
+            .and_then(|text| text.split_once('|').map(|(_, name)| name.to_owned()));
+            let got = PgTimeZone::parse(setting)
+                .ok()
+                .map(|zone| zone.name().to_owned());
+            (got != expected)
+                .then(|| format!("{setting:?}: crate {got:?}, PostgreSQL {expected:?}"))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 // Raw SQL: vendor cast syntax cannot be expressed in the Diesel DSL.

@@ -7,11 +7,12 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/connetto-rs/sql-values)
 [![license](https://img.shields.io/crates/l/sql-values.svg)](https://github.com/connetto-rs/sql-values/blob/main/LICENSE)
 
-`sql-values` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order, arithmetic and the explicit cast of a literal), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value. Dates and times are held as PostgreSQL stores them, over its whole range.
+`sql-values` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order, arithmetic and the explicit cast of a literal), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value. Dates and times are held as PostgreSQL stores them, over its whole range, and `timestamptz` arithmetic runs in a named time zone from jiff's bundled IANA database.
 
 ```rust
 use sql_values::{
-    CastTarget, IntervalError, Literal, cast_literal, parse_bool, parse_interval, parse_timestamp,
+    CastTarget, InputContext, IntervalError, Literal, PgTimeZone, PgTimestampTz, cast_literal,
+    parse_bool, parse_interval, parse_timestamp,
 };
 
 assert_eq!(parse_bool("t"), Some(true));
@@ -23,6 +24,11 @@ assert_eq!(parse_interval("p1d"), Err(IntervalError::InvalidSyntax));
 let at = parse_timestamp("294276-12-31 10:00:00").unwrap();
 let day = parse_interval("1 day").unwrap();
 assert_eq!(day.subtract_from_timestamp(at).unwrap().to_string(), "294276-12-30 10:00:00");
+
+let rome = PgTimeZone::parse("Europe/Rome").unwrap();
+let noon = PgTimestampTz::parse("2026-03-29 12:00:00+02", InputContext::new()).unwrap();
+let before = day.subtract_from_timestamptz(noon, &rome).unwrap();
+assert_eq!(before.to_string(), "2026-03-28 11:00:00+00");
 
 let level = cast_literal(Literal::Number("2.7"), CastTarget::Integer).unwrap();
 assert_eq!(level.to_string(), "3");
