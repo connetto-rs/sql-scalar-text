@@ -15,11 +15,15 @@ fuzz_target!(|data: &[u8]| {
     let Some(parsed) = parse_timestamp(text) else {
         return;
     };
-    let times = time_spellings::time_spellings(parsed.time());
+    // `infinity` has no date or clock to spell.
+    let Some(parsed_time) = parsed.time() else {
+        return;
+    };
+    let times = time_spellings::time_spellings(parsed_time);
     for time in &times {
         assert_eq!(
             parse_time(time),
-            Some(parsed.time()),
+            Some(parsed_time),
             "{text:?} time {time:?}"
         );
     }

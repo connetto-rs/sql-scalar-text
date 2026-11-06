@@ -1,15 +1,13 @@
-use chrono::{NaiveTime, Timelike};
+use sql_values::PgTime;
 
-/// Every accepted spelling of `time`: nine fraction digits, six when exact, and the shortest.
-pub fn time_spellings(time: NaiveTime) -> Vec<String> {
-    let hms = time.format("%H:%M:%S");
-    let nanos = format!("{:09}", time.nanosecond());
-    let mut spellings = vec![format!("{hms}.{nanos}")];
-    if nanos.ends_with("000") {
-        spellings.push(format!("{hms}.{}", &nanos[..6]));
-    }
-    match nanos.trim_end_matches('0') {
-        "" => spellings.push(hms.to_string()),
+/// Every accepted spelling of `time`: nine fraction digits, six, and the shortest.
+pub fn time_spellings(time: PgTime) -> Vec<String> {
+    let (hour, minute, second, micro) = time.hms_micro();
+    let hms = format!("{hour:02}:{minute:02}:{second:02}");
+    let six = format!("{micro:06}");
+    let mut spellings = vec![format!("{hms}.{six}000"), format!("{hms}.{six}")];
+    match six.trim_end_matches('0') {
+        "" => spellings.push(hms),
         shortest => spellings.push(format!("{hms}.{shortest}")),
     }
     spellings

@@ -3,7 +3,6 @@
 
 mod arithmetic;
 mod decode;
-mod float;
 
 use core::{
     cmp::Ordering,
@@ -12,7 +11,6 @@ use core::{
 };
 
 pub use arithmetic::{IntervalSum, ShiftError};
-pub(crate) use arithmetic::{chrono_timestamp, pg_microseconds, pg_timestamp, valid_timestamp};
 use decode::{
     INTERVAL_FULL_RANGE, RANGE_DAY, RANGE_HOUR, RANGE_MINUTE, RANGE_MONTH, RANGE_SECOND,
     RANGE_YEAR, interval_in,

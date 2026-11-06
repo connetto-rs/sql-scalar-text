@@ -1,7 +1,9 @@
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use sql_values::{parse_bool, parse_date, parse_f64, parse_i64, parse_time, parse_timestamp};
+use sql_values::{
+    PgDate, PgTime, PgTimestamp, parse_bool, parse_date, parse_f64, parse_i64, parse_time,
+    parse_timestamp,
+};
 
 diesel::table! {
     scalars (id) {
@@ -46,30 +48,33 @@ fn read_txt(conn: &mut SqliteConnection, id: i32) -> String {
 fn sqlite_timestamp_iso_text() {
     let mut conn = mem_conn();
 
-    let rows: &[(i32, &str, NaiveDateTime)] = &[
+    let rows: &[(i32, &str, PgTimestamp)] = &[
         (
             1,
             "2024-01-15 10:30:45",
-            NaiveDate::from_ymd_opt(2024, 1, 15)
-                .unwrap()
-                .and_hms_opt(10, 30, 45)
-                .unwrap(),
+            PgTimestamp::new(
+                PgDate::from_ymd(2024, 1, 15).unwrap(),
+                PgTime::from_hms_micro(10, 30, 45, 0).unwrap(),
+            )
+            .unwrap(),
         ),
         (
             2,
             "2024-01-15 10:30:45.123456",
-            NaiveDate::from_ymd_opt(2024, 1, 15)
-                .unwrap()
-                .and_hms_micro_opt(10, 30, 45, 123456)
-                .unwrap(),
+            PgTimestamp::new(
+                PgDate::from_ymd(2024, 1, 15).unwrap(),
+                PgTime::from_hms_micro(10, 30, 45, 123_456).unwrap(),
+            )
+            .unwrap(),
         ),
         (
             3,
             "2024-02-29 23:59:59",
-            NaiveDate::from_ymd_opt(2024, 2, 29)
-                .unwrap()
-                .and_hms_opt(23, 59, 59)
-                .unwrap(),
+            PgTimestamp::new(
+                PgDate::from_ymd(2024, 2, 29).unwrap(),
+                PgTime::from_hms_micro(23, 59, 59, 0).unwrap(),
+            )
+            .unwrap(),
         ),
     ];
 
@@ -92,22 +97,10 @@ fn sqlite_timestamp_iso_text() {
 fn sqlite_date_iso_text() {
     let mut conn = mem_conn();
 
-    let rows: &[(i32, &str, NaiveDate)] = &[
-        (
-            1,
-            "2024-01-15",
-            NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
-        ),
-        (
-            2,
-            "2024-02-29",
-            NaiveDate::from_ymd_opt(2024, 2, 29).unwrap(),
-        ),
-        (
-            3,
-            "2000-01-01",
-            NaiveDate::from_ymd_opt(2000, 1, 1).unwrap(),
-        ),
+    let rows: &[(i32, &str, PgDate)] = &[
+        (1, "2024-01-15", PgDate::from_ymd(2024, 1, 15).unwrap()),
+        (2, "2024-02-29", PgDate::from_ymd(2024, 2, 29).unwrap()),
+        (3, "2000-01-01", PgDate::from_ymd(2000, 1, 1).unwrap()),
     ];
 
     for (id, txt, expected) in rows {
@@ -130,16 +123,13 @@ fn sqlite_year_zero_and_before() {
     let mut conn = mem_conn();
 
     let text = sqlite_text(&mut conn, "date('0000-02-29')");
-    assert_eq!(
-        parse_date(&text),
-        NaiveDate::from_ymd_opt(0, 2, 29),
-        "{text:?}"
-    );
+    assert_eq!(parse_date(&text), PgDate::from_ymd(0, 2, 29), "{text:?}");
 
     let text = sqlite_text(&mut conn, "datetime('0000-01-01 12:00:00')");
-    let expected = NaiveDate::from_ymd_opt(0, 1, 1)
-        .unwrap()
-        .and_hms_opt(12, 0, 0);
+    let expected = PgTimestamp::new(
+        PgDate::from_ymd(0, 1, 1).unwrap(),
+        PgTime::from_hms_micro(12, 0, 0, 0).unwrap(),
+    );
     assert_eq!(parse_timestamp(&text), expected, "{text:?}");
 
     // PostgreSQL and MySQL both reject a signed year on input.
@@ -152,14 +142,22 @@ fn sqlite_year_zero_and_before() {
 fn sqlite_time_iso_text() {
     let mut conn = mem_conn();
 
-    let rows: &[(i32, &str, NaiveTime)] = &[
-        (1, "10:30:45", NaiveTime::from_hms_opt(10, 30, 45).unwrap()),
+    let rows: &[(i32, &str, PgTime)] = &[
+        (
+            1,
+            "10:30:45",
+            PgTime::from_hms_micro(10, 30, 45, 0).unwrap(),
+        ),
         (
             2,
             "10:30:45.123456",
-            NaiveTime::from_hms_micro_opt(10, 30, 45, 123456).unwrap(),
+            PgTime::from_hms_micro(10, 30, 45, 123_456).unwrap(),
         ),
-        (3, "23:59:59", NaiveTime::from_hms_opt(23, 59, 59).unwrap()),
+        (
+            3,
+            "23:59:59",
+            PgTime::from_hms_micro(23, 59, 59, 0).unwrap(),
+        ),
     ];
 
     for (id, txt, expected) in rows {

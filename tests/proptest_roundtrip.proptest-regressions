@@ -4,4 +4,6 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 29cf80f15f319e6f3b85ba45136378bce0f532a14357e446a017ca2c2853c35d # shrinks to dt = 1970-01-01T00:00:00, offset = 0
+
+cc 6d6b3ff2e11e65239e0891379a026bbc41f8f9dd409614056492c99f7ed722cc # shrinks to ts = PgTimestamp(-63082281600000001)
+cc 1b9e621199ae59985158f9e254e1193408f5b3d9526dff61fced5b50e222b306 # shrinks to ts = PgTimestamp(-63082356977000001), offset = 0

@@ -1,40 +1,42 @@
-use chrono::{Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use core::fmt::Write as _;
 use proptest::prelude::*;
 use sql_values::{
-    PgInterval, parse_bool, parse_date, parse_f64, parse_i64, parse_interval, parse_pg_bytea_hex,
-    parse_time, parse_timestamp, parse_timestamp_tz,
+    PgDate, PgInterval, PgTime, PgTimestamp, PgTimestampTz, parse_bool, parse_date, parse_f64,
+    parse_i64, parse_interval, parse_pg_bytea_hex, parse_time, parse_timestamp, parse_timestamp_tz,
 };
 use std::hash::BuildHasher as _;
 
-fn date_strategy() -> impl Strategy<Value = NaiveDate> {
-    (1970i32..=2100, 1u32..=366u32).prop_filter_map("valid calendar date", |(year, doy)| {
-        NaiveDate::from_yo_opt(year, doy)
-    })
+/// The day, days from 2000-01-01, of 4714-11-24 BC, the first date PostgreSQL holds.
+const MIN_PG_DAYS: i32 = -2_451_545;
+/// The day, days from 2000-01-01, of 5874897-12-31, the last date PostgreSQL holds.
+const MAX_PG_DAYS: i32 = 2_145_031_948;
+/// The microsecond, from 2000-01-01, of 4714-11-24 00:00:00 BC, the first timestamp.
+const MIN_TS_MICROS: i64 = -211_813_488_000_000_000;
+/// The microsecond, from 2000-01-01, of 294276-12-31 23:59:59.999999, the last timestamp.
+const MAX_TS_MICROS: i64 = 9_223_371_331_199_999_999;
+
+fn date_strategy() -> impl Strategy<Value = PgDate> {
+    (1970i32..=2100, 1u8..=12, 1u8..=31)
+        .prop_filter_map("valid calendar date", |(year, month, day)| {
+            PgDate::from_ymd(year, month, day)
+        })
 }
 
-fn full_range_date_strategy() -> impl Strategy<Value = NaiveDate> {
-    (NaiveDate::MIN.num_days_from_ce()..=NaiveDate::MAX.num_days_from_ce())
-        .prop_map(|days| NaiveDate::from_num_days_from_ce_opt(days).unwrap())
+fn full_range_date_strategy() -> impl Strategy<Value = PgDate> {
+    (MIN_PG_DAYS..=MAX_PG_DAYS).prop_map(|days| PgDate::from_pg_days(days).unwrap())
 }
 
-/// PostgreSQL's date spelling and its era suffix, which trails the whole value.
-fn pg_date(d: NaiveDate) -> (String, &'static str) {
-    let (year, era) = if d.year() >= 1 {
-        (d.year(), "")
-    } else {
-        (1 - d.year(), " BC")
-    };
-    (format!("{year:04}-{}", d.format("%m-%d")), era)
+fn time_strategy() -> impl Strategy<Value = PgTime> {
+    (0i64..=86_400_000_000).prop_map(|micros| PgTime::from_micros(micros).unwrap())
 }
 
-fn time_strategy() -> impl Strategy<Value = NaiveTime> {
-    (0u32..24, 0u32..60, 0u32..60, 0u32..1_000_000)
-        .prop_map(|(h, m, s, us)| NaiveTime::from_hms_micro_opt(h, m, s, us).unwrap())
+fn datetime_strategy() -> impl Strategy<Value = PgTimestamp> {
+    (date_strategy(), time_strategy())
+        .prop_map(|(date, time)| PgTimestamp::new(date, time).unwrap())
 }
 
-fn datetime_strategy() -> impl Strategy<Value = NaiveDateTime> {
-    (date_strategy(), time_strategy()).prop_map(|(d, t)| d.and_time(t))
+fn full_range_timestamp_strategy() -> impl Strategy<Value = PgTimestamp> {
+    (MIN_TS_MICROS..=MAX_TS_MICROS).prop_map(|micros| PgTimestamp::from_pg_micros(micros).unwrap())
 }
 
 fn offset_secs_strategy() -> impl Strategy<Value = i32> {
@@ -49,23 +51,9 @@ fn whole_hour_offset_secs_strategy() -> impl Strategy<Value = i32> {
     (-23i32..=23).prop_map(|h| h * 3600)
 }
 
-fn strip_frac_zeros(s: &str) -> String {
-    if let Some(dot) = s.rfind('.') {
-        let trimmed = s[dot + 1..].trim_end_matches('0');
-        if trimmed.is_empty() {
-            s[..dot].to_owned()
-        } else {
-            format!("{}.{trimmed}", &s[..dot])
-        }
-    } else {
-        s.to_owned()
-    }
-}
-
-fn fmt_local(utc: chrono::DateTime<Utc>, offset: i32) -> String {
-    let fo = FixedOffset::east_opt(offset).unwrap();
-    let local = utc.with_timezone(&fo);
-    strip_frac_zeros(&local.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+/// The local clock `offset` seconds east of the UTC instant `utc`, as a plain timestamp.
+fn fmt_local(utc: PgTimestamp, offset: i32) -> PgTimestamp {
+    PgTimestamp::from_pg_micros(utc.pg_micros() + i64::from(offset) * 1_000_000).unwrap()
 }
 
 fn offset_parts(offset: i32) -> (char, u32, u32, u32) {
@@ -80,7 +68,7 @@ fn offset_parts(offset: i32) -> (char, u32, u32, u32) {
 proptest! {
     #[test]
     fn timestamp_pg_layout_roundtrip(dt in datetime_strategy()) {
-        let text = strip_frac_zeros(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+        let text = format!("{} {}", dt.date(), dt.time().unwrap());
         let got = parse_timestamp(&text)
             .unwrap_or_else(|| panic!("parse_timestamp: {text:?}"));
         prop_assert_eq!(got, dt);
@@ -88,7 +76,7 @@ proptest! {
 
     #[test]
     fn timestamp_t_separator_roundtrip(dt in datetime_strategy()) {
-        let text = strip_frac_zeros(&dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string());
+        let text = format!("{}T{}", dt.date(), dt.time().unwrap());
         let got = parse_timestamp(&text)
             .unwrap_or_else(|| panic!("parse_timestamp T: {text:?}"));
         prop_assert_eq!(got, dt);
@@ -96,61 +84,56 @@ proptest! {
 
     #[test]
     fn timestamp_tz_z_roundtrip(dt in datetime_strategy()) {
-        let utc = Utc.from_utc_datetime(&dt);
-        let local = strip_frac_zeros(&utc.format("%Y-%m-%dT%H:%M:%S%.6f").to_string());
+        let local = dt.to_string();
         let text = format!("{local}Z");
         let got = parse_timestamp_tz(&text)
             .unwrap_or_else(|| panic!("parse_timestamp_tz Z: {text:?}"));
-        prop_assert_eq!(got, utc);
+        prop_assert_eq!(got, PgTimestampTz::from_pg_micros(dt.pg_micros()).unwrap());
     }
 
     #[test]
     fn timestamp_tz_plus_hh_roundtrip(dt in datetime_strategy(), offset in whole_hour_offset_secs_strategy()) {
-        let utc = Utc.from_utc_datetime(&dt);
-        let local = fmt_local(utc, offset);
+        let local = fmt_local(dt, offset);
         let (sign, h, _m, _s) = offset_parts(offset);
-        let text = format!("{local}{sign}{h:02}");
+        let text = format!("{} {time}{sign}{h:02}", local.date(), time = local.time().unwrap());
         let got = parse_timestamp_tz(&text)
             .unwrap_or_else(|| panic!("parse_timestamp_tz +hh: {text:?}"));
-        prop_assert_eq!(got, utc);
+        prop_assert_eq!(got, PgTimestampTz::from_pg_micros(dt.pg_micros()).unwrap());
     }
 
     #[test]
     fn timestamp_tz_plus_hhmm_roundtrip(dt in datetime_strategy(), offset in offset_secs_strategy()) {
-        let utc = Utc.from_utc_datetime(&dt);
-        let local = fmt_local(utc, offset);
+        let local = fmt_local(dt, offset);
         let (sign, h, m, _s) = offset_parts(offset);
-        let text = format!("{local}{sign}{h:02}{m:02}");
+        let text = format!("{} {time}{sign}{h:02}{m:02}", local.date(), time = local.time().unwrap());
         let got = parse_timestamp_tz(&text)
             .unwrap_or_else(|| panic!("parse_timestamp_tz +hhmm: {text:?}"));
-        prop_assert_eq!(got, utc);
+        prop_assert_eq!(got, PgTimestampTz::from_pg_micros(dt.pg_micros()).unwrap());
     }
 
     #[test]
     fn timestamp_tz_plus_hh_colon_mm_roundtrip(dt in datetime_strategy(), offset in offset_secs_strategy()) {
-        let utc = Utc.from_utc_datetime(&dt);
-        let local = fmt_local(utc, offset);
+        let local = fmt_local(dt, offset);
         let (sign, h, m, _s) = offset_parts(offset);
-        let text = format!("{local}{sign}{h:02}:{m:02}");
+        let text = format!("{} {time}{sign}{h:02}:{m:02}", local.date(), time = local.time().unwrap());
         let got = parse_timestamp_tz(&text)
             .unwrap_or_else(|| panic!("parse_timestamp_tz +hh:mm: {text:?}"));
-        prop_assert_eq!(got, utc);
+        prop_assert_eq!(got, PgTimestampTz::from_pg_micros(dt.pg_micros()).unwrap());
     }
 
     #[test]
     fn timestamp_tz_plus_hh_colon_mm_colon_ss_roundtrip(dt in datetime_strategy(), offset in second_offset_secs_strategy()) {
-        let utc = Utc.from_utc_datetime(&dt);
-        let local = fmt_local(utc, offset);
+        let local = fmt_local(dt, offset);
         let (sign, h, m, s) = offset_parts(offset);
-        let text = format!("{local}{sign}{h:02}:{m:02}:{s:02}");
+        let text = format!("{} {time}{sign}{h:02}:{m:02}:{s:02}", local.date(), time = local.time().unwrap());
         let got = parse_timestamp_tz(&text)
             .unwrap_or_else(|| panic!("parse_timestamp_tz +hh:mm:ss: {text:?}"));
-        prop_assert_eq!(got, utc);
+        prop_assert_eq!(got, PgTimestampTz::from_pg_micros(dt.pg_micros()).unwrap());
     }
 
     #[test]
     fn date_iso_roundtrip(d in date_strategy()) {
-        let text = d.format("%Y-%m-%d").to_string();
+        let text = d.to_string();
         let got = parse_date(&text)
             .unwrap_or_else(|| panic!("parse_date: {text:?}"));
         prop_assert_eq!(got, d);
@@ -158,7 +141,7 @@ proptest! {
 
     #[test]
     fn time_iso_roundtrip(t in time_strategy()) {
-        let text = strip_frac_zeros(&t.format("%H:%M:%S%.6f").to_string());
+        let text = t.to_string();
         let got = parse_time(&text)
             .unwrap_or_else(|| panic!("parse_time: {text:?}"));
         prop_assert_eq!(got, t);
@@ -166,33 +149,42 @@ proptest! {
 
     #[test]
     fn date_pg_full_range_roundtrip(d in full_range_date_strategy()) {
-        let (date, era) = pg_date(d);
-        let text = format!("{date}{era}");
+        let text = d.to_string();
         prop_assert_eq!(parse_date(&text), Some(d), "{}", text);
     }
 
     #[test]
-    fn timestamp_pg_full_range_roundtrip(d in full_range_date_strategy(), t in time_strategy()) {
-        let (date, era) = pg_date(d);
-        let time = strip_frac_zeros(&t.format("%H:%M:%S%.6f").to_string());
-        let text = format!("{date} {time}{era}");
-        prop_assert_eq!(parse_timestamp(&text), Some(d.and_time(t)), "{}", text);
+    fn timestamp_pg_full_range_roundtrip(ts in full_range_timestamp_strategy()) {
+        // The ` BC` suffix trails the whole value, so the spelling is the value's own print.
+        let text = ts.to_string();
+        prop_assert_eq!(parse_timestamp(&text), Some(ts), "{}", text);
     }
 
     #[test]
     fn timestamp_tz_pg_full_range_roundtrip(
-        d in full_range_date_strategy(),
-        t in time_strategy(),
+        ts in full_range_timestamp_strategy(),
         offset in second_offset_secs_strategy(),
     ) {
-        let local = d.and_time(t);
-        let utc = FixedOffset::east_opt(offset).unwrap().from_local_datetime(&local).single();
-        prop_assume!(utc.is_some());
-        let (date, era) = pg_date(d);
-        let time = strip_frac_zeros(&t.format("%H:%M:%S%.6f").to_string());
+        let Some(local) =
+            PgTimestamp::from_pg_micros(ts.pg_micros() + i64::from(offset) * 1_000_000)
+        else {
+            return Ok(());
+        };
         let (sign, h, m, s) = offset_parts(offset);
-        let text = format!("{date} {time}{sign}{h:02}:{m:02}:{s:02}{era}");
-        prop_assert_eq!(parse_timestamp_tz(&text), utc.map(|dt| dt.with_timezone(&Utc)), "{}", text);
+        let zone = format!("{sign}{h:02}:{m:02}:{s:02}");
+        // The offset sits before the ` BC` suffix, which trails the whole value.
+        let local_text = local.to_string();
+        let text = if let Some(stripped) = local_text.strip_suffix(" BC") {
+            format!("{stripped}{zone} BC")
+        } else {
+            format!("{local_text}{zone}")
+        };
+        prop_assert_eq!(
+            parse_timestamp_tz(&text),
+            Some(PgTimestampTz::from_pg_micros(ts.pg_micros()).unwrap()),
+            "{}",
+            text
+        );
     }
 }
 
@@ -209,7 +201,7 @@ fn timestamp_corpus_idempotence() {
     ];
     for &s in &corpus {
         let v = parse_timestamp(s).unwrap_or_else(|| panic!("first parse: {s:?}"));
-        let text = strip_frac_zeros(&v.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
+        let text = v.to_string();
         let w = parse_timestamp(&text).unwrap_or_else(|| panic!("second parse: {text:?}"));
         assert_eq!(v, w, "idempotence: {s:?}");
     }
@@ -231,8 +223,7 @@ fn timestamp_tz_corpus_idempotence() {
     ];
     for &s in &corpus {
         let v = parse_timestamp_tz(s).unwrap_or_else(|| panic!("first parse: {s:?}"));
-        let formatted = strip_frac_zeros(&v.format("%Y-%m-%dT%H:%M:%S%.9f").to_string());
-        let text = format!("{formatted}Z");
+        let text = v.to_string();
         let w = parse_timestamp_tz(&text).unwrap_or_else(|| panic!("second parse: {text:?}"));
         assert_eq!(v, w, "idempotence: {s:?}");
     }
@@ -243,7 +234,7 @@ fn date_corpus_idempotence() {
     let corpus = ["2026-01-01", "2024-01-15", "2000-02-29", "1970-01-01"];
     for &s in &corpus {
         let v = parse_date(s).unwrap_or_else(|| panic!("first parse: {s:?}"));
-        let text = v.format("%Y-%m-%d").to_string();
+        let text = v.to_string();
         let w = parse_date(&text).unwrap_or_else(|| panic!("second parse: {text:?}"));
         assert_eq!(v, w, "idempotence: {s:?}");
     }
@@ -254,7 +245,7 @@ fn time_corpus_idempotence() {
     let corpus = ["00:00:00", "12:34:56.789", "10:30:45", "23:59:59"];
     for &s in &corpus {
         let v = parse_time(s).unwrap_or_else(|| panic!("first parse: {s:?}"));
-        let text = strip_frac_zeros(&v.format("%H:%M:%S%.6f").to_string());
+        let text = v.to_string();
         let w = parse_time(&text).unwrap_or_else(|| panic!("second parse: {text:?}"));
         assert_eq!(v, w, "idempotence: {s:?}");
     }

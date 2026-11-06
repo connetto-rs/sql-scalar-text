@@ -3,10 +3,13 @@
 
 use core::cmp::Ordering;
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-
-use super::{
-    IntervalError, PgInterval,
+use super::{IntervalError, PgInterval};
+use crate::{
+    PgTime, PgTimestamp,
+    datetime::{
+        MONTHS_PER_YEAR, USECS_PER_DAY, USECS_PER_SEC, date2j, days_in_month, is_valid_timestamp,
+        j2date, timestamp2tm, tm2timestamp,
+    },
     float::{
         fits_in_i32, fits_in_i64, int_to_f64, round_ties_even, truncate_to_i32, truncate_to_i64,
         ts_round,
@@ -15,18 +18,6 @@ use super::{
 
 const DAYS_PER_MONTH: f64 = 30.0;
 const SECS_PER_DAY: f64 = 86_400.0;
-const MONTHS_PER_YEAR: i32 = 12;
-const USECS_PER_DAY: i64 = 86_400_000_000;
-const USECS_PER_SEC: i64 = 1_000_000;
-
-/// `POSTGRES_EPOCH_JDATE`, the Julian day of 2000-01-01.
-const POSTGRES_EPOCH_JDATE: i64 = 2_451_545;
-/// The Julian day of 0001-01-01 less one, as `chrono` counts that day as day 1 of the era.
-const JULIAN_BEFORE_CE: i64 = 1_721_425;
-/// `MIN_TIMESTAMP`, 4714-11-24 BC.
-const MIN_TIMESTAMP: i64 = -211_813_488_000_000_000;
-/// `END_TIMESTAMP`, 294277-01-01, past the last timestamp.
-const END_TIMESTAMP: i64 = 9_223_371_331_200_000_000;
 
 /// Why a timestamp or time shifted by an interval has no value here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
@@ -43,10 +34,6 @@ pub enum ShiftError {
     /// `time - interval` of an infinite interval.
     #[error("cannot subtract infinite interval from time")]
     InfiniteIntervalSubtractedFromTime,
-    /// PostgreSQL answers a timestamp `chrono` cannot hold, `infinity`, `-infinity` or one past
-    /// `chrono`'s last year.
-    #[error("timestamp beyond chrono")]
-    Unrepresentable,
 }
 
 impl PgInterval {
@@ -285,14 +272,12 @@ impl PgInterval {
 
     /// PostgreSQL's `timestamp_pl_interval`, `at + self`: months added to the calendar month with
     /// the day clamped to the month's last, then days added to the calendar day, then the clock.
-    ///
-    /// The timestamp is read to the microsecond, as PostgreSQL holds it.
+    /// An infinite timestamp or interval gives an infinity.
     ///
     /// # Errors
     ///
-    /// [`ShiftError::TimestampOutOfRange`] where `at` or a step lies outside PostgreSQL's
-    /// timestamps, and [`ShiftError::Unrepresentable`] where PostgreSQL answers `infinity`,
-    /// `-infinity` or a year past `chrono`'s.
+    /// [`ShiftError::TimestampOutOfRange`] where a step leaves PostgreSQL's timestamps, or where
+    /// opposite infinities meet.
     ///
     /// ```
     /// use sql_values::{parse_interval, parse_timestamp};
@@ -301,17 +286,38 @@ impl PgInterval {
     /// let month = parse_interval("1 mon").unwrap();
     /// assert_eq!(month.add_to_timestamp(at).unwrap().to_string(), "2024-02-29 10:00:00");
     /// ```
-    pub fn add_to_timestamp(self, at: NaiveDateTime) -> Result<NaiveDateTime, ShiftError> {
-        let timestamp = pg_timestamp(at)?;
-        if !self.is_finite() {
-            return Err(ShiftError::Unrepresentable);
+    pub fn add_to_timestamp(self, at: PgTimestamp) -> Result<PgTimestamp, ShiftError> {
+        let shifted = self.shift(at.pg_micros())?;
+        Ok(PgTimestamp::from_pg_micros(shifted).expect("a shifted timestamp is checked"))
+    }
+
+    /// PostgreSQL's `timestamp_mi_interval`, `at - self`, which adds the negated interval.
+    ///
+    /// # Errors
+    ///
+    /// [`ShiftError::IntervalOutOfRange`] where `interval_um` refuses the interval, and the
+    /// errors of [`add_to_timestamp`](Self::add_to_timestamp).
+    pub fn subtract_from_timestamp(self, at: PgTimestamp) -> Result<PgTimestamp, ShiftError> {
+        self.checked_neg()
+            .map_err(|_| ShiftError::IntervalOutOfRange)?
+            .add_to_timestamp(at)
+    }
+
+    /// `timestamp_pl_interval` over the stored microseconds.
+    fn shift(self, at: i64) -> Result<i64, ShiftError> {
+        let out_of_range = ShiftError::TimestampOutOfRange;
+        match self.infinity() {
+            Some(Ordering::Less) if at == i64::MAX => return Err(out_of_range),
+            Some(Ordering::Less) => return Ok(i64::MIN),
+            Some(Ordering::Greater) if at == i64::MIN => return Err(out_of_range),
+            Some(_) => return Ok(i64::MAX),
+            None if at == i64::MAX || at == i64::MIN => return Ok(at),
+            None => {}
         }
-        let mut timestamp = timestamp;
+        let mut timestamp = at;
         if self.months != 0 {
             let (mut year, month, mut day, clock) = timestamp2tm(timestamp);
-            let mut month = month
-                .checked_add(self.months)
-                .ok_or(ShiftError::TimestampOutOfRange)?;
+            let mut month = month.checked_add(self.months).ok_or(out_of_range)?;
             // C's truncating division and remainder.
             if month > MONTHS_PER_YEAR {
                 year += (month - 1) / MONTHS_PER_YEAR;
@@ -321,42 +327,31 @@ impl PgInterval {
                 month = month % MONTHS_PER_YEAR + MONTHS_PER_YEAR;
             }
             day = day.min(days_in_month(year, month));
-            timestamp = tm2timestamp(year, month, day, clock)?;
+            timestamp = tm2timestamp(year, month, day, clock, 0).ok_or(out_of_range)?;
         }
         if self.days != 0 {
             let (year, month, day, clock) = timestamp2tm(timestamp);
             let julian = date2j(year, month, day)
                 .checked_add(self.days)
                 .filter(|julian| *julian >= 0)
-                .ok_or(ShiftError::TimestampOutOfRange)?;
+                .ok_or(out_of_range)?;
             let (year, month, day) = j2date(julian);
-            timestamp = tm2timestamp(year, month, day, clock)?;
+            timestamp = tm2timestamp(year, month, day, clock, 0).ok_or(out_of_range)?;
         }
-        let timestamp = timestamp
+        timestamp
             .checked_add(self.microseconds)
-            .filter(|timestamp| (MIN_TIMESTAMP..END_TIMESTAMP).contains(timestamp))
-            .ok_or(ShiftError::TimestampOutOfRange)?;
-        chrono_timestamp(timestamp)
-    }
-
-    /// PostgreSQL's `timestamp_mi_interval`, `at - self`, which adds the negated interval.
-    ///
-    /// # Errors
-    ///
-    /// [`ShiftError::IntervalOutOfRange`] where `interval_um` refuses the interval, and the
-    /// errors of [`add_to_timestamp`](Self::add_to_timestamp).
-    pub fn subtract_from_timestamp(self, at: NaiveDateTime) -> Result<NaiveDateTime, ShiftError> {
-        self.checked_neg()
-            .map_err(|_| ShiftError::IntervalOutOfRange)?
-            .add_to_timestamp(at)
+            .filter(|&timestamp| is_valid_timestamp(timestamp))
+            .ok_or(out_of_range)
     }
 
     /// PostgreSQL's `timestamp_mi`, `later - earlier`, with whole days carried into the days
-    /// field as `interval_justify_hours` carries them.
+    /// field as `interval_justify_hours` carries them. An infinite timestamp gives an infinite
+    /// interval.
     ///
     /// # Errors
     ///
-    /// [`ShiftError::TimestampOutOfRange`] where a timestamp lies outside PostgreSQL's.
+    /// [`ShiftError::IntervalOutOfRange`] where equal infinities meet, or where the difference
+    /// passes 2^63 microseconds.
     ///
     /// ```
     /// use sql_values::{PgInterval, parse_timestamp};
@@ -367,16 +362,27 @@ impl PgInterval {
     /// assert_eq!(span.to_string(), "1 day 18:00:00");
     /// ```
     pub fn timestamp_difference(
-        later: NaiveDateTime,
-        earlier: NaiveDateTime,
+        later: PgTimestamp,
+        earlier: PgTimestamp,
     ) -> Result<Self, ShiftError> {
-        // Both lie within PostgreSQL's range, so their difference fits.
-        let time = pg_timestamp(later)? - pg_timestamp(earlier)?;
+        let (later, earlier) = (later.pg_micros(), earlier.pg_micros());
+        let infinite = |micros: i64| micros == i64::MAX || micros == i64::MIN;
+        if infinite(later) || infinite(earlier) {
+            return match (later, earlier) {
+                (i64::MIN, i64::MIN) | (i64::MAX, i64::MAX) => Err(ShiftError::IntervalOutOfRange),
+                (i64::MIN, _) | (_, i64::MAX) => Ok(Self::NEG_INFINITY),
+                _ => Ok(Self::INFINITY),
+            };
+        }
+        // Timestamps at opposite ends of PostgreSQL's range lie more than 2^63 microseconds
+        // apart.
+        let time = later
+            .checked_sub(earlier)
+            .ok_or(ShiftError::IntervalOutOfRange)?;
         // Division truncates toward zero, so the days and the clock share the sign of the
-        // difference and the sign corrections of `interval_justify_hours` never apply.
-        // Valid timestamps lie under 2^27 days apart, which `int` holds.
-        let days =
-            i32::try_from(time / USECS_PER_DAY).expect("timestamps lie under 2^27 days apart");
+        // difference and the sign corrections of `interval_justify_hours` never apply. 2^63
+        // microseconds are under 2^27 days, which `int` holds.
+        let days = i32::try_from(time / USECS_PER_DAY).expect("2^63 microseconds fit int days");
         Ok(Self {
             months: 0,
             days,
@@ -399,11 +405,11 @@ impl PgInterval {
     /// let span = parse_interval("1 day 02:30:00").unwrap();
     /// assert_eq!(span.add_to_time(at).unwrap().to_string(), "01:30:00");
     /// ```
-    pub fn add_to_time(self, at: NaiveTime) -> Result<NaiveTime, ShiftError> {
+    pub fn add_to_time(self, at: PgTime) -> Result<PgTime, ShiftError> {
         if !self.is_finite() {
             return Err(ShiftError::InfiniteIntervalAddedToTime);
         }
-        Ok(wrap_time(pg_time(at).wrapping_add(self.microseconds)))
+        Ok(wrap_time(at.micros().wrapping_add(self.microseconds)))
     }
 
     /// PostgreSQL's `time_mi_interval`, `at - self`, as [`add_to_time`](Self::add_to_time) with
@@ -412,11 +418,11 @@ impl PgInterval {
     /// # Errors
     ///
     /// [`ShiftError::InfiniteIntervalSubtractedFromTime`] for an infinite interval.
-    pub fn subtract_from_time(self, at: NaiveTime) -> Result<NaiveTime, ShiftError> {
+    pub fn subtract_from_time(self, at: PgTime) -> Result<PgTime, ShiftError> {
         if !self.is_finite() {
             return Err(ShiftError::InfiniteIntervalSubtractedFromTime);
         }
-        Ok(wrap_time(pg_time(at).wrapping_sub(self.microseconds)))
+        Ok(wrap_time(at.micros().wrapping_sub(self.microseconds)))
     }
 }
 
@@ -427,125 +433,9 @@ struct FieldResults {
     microseconds: Option<i64>,
 }
 
-/// A time as PostgreSQL holds it, microseconds since midnight.
-fn pg_time(at: NaiveTime) -> i64 {
-    i64::from(at.num_seconds_from_midnight()) * USECS_PER_SEC + i64::from(at.nanosecond() / 1_000)
-}
-
 /// The time of `moved` microseconds reduced into the day, as `time_pl_interval` reduces it.
-fn wrap_time(moved: i64) -> NaiveTime {
-    let micros = moved.rem_euclid(USECS_PER_DAY);
-    // `rem_euclid` keeps `micros` within one day, which both parts of the clock fit.
-    let seconds = u32::try_from(micros / USECS_PER_SEC).expect("a second of the day fits u32");
-    let nanos = u32::try_from(micros % USECS_PER_SEC * 1_000).expect("a nanosecond fits u32");
-    NaiveTime::from_num_seconds_from_midnight_opt(seconds, nanos)
-        .expect("a clock within the day is a time")
-}
-
-/// A timestamp as PostgreSQL holds it, microseconds from 2000-01-01.
-pub(crate) fn pg_timestamp(at: NaiveDateTime) -> Result<i64, ShiftError> {
-    valid_timestamp(pg_microseconds(at))
-}
-
-/// Microseconds from 2000-01-01 to `at`, which may lie outside PostgreSQL's range.
-pub(crate) fn pg_microseconds(at: NaiveDateTime) -> i64 {
-    let days = i64::from(at.date().num_days_from_ce()) + JULIAN_BEFORE_CE - POSTGRES_EPOCH_JDATE;
-    // `chrono` holds under 2^27 days either side, so the microseconds fit.
-    days * USECS_PER_DAY + pg_time(at.time())
-}
-
-/// `IS_VALID_TIMESTAMP`.
-pub(crate) fn valid_timestamp(timestamp: i64) -> Result<i64, ShiftError> {
-    if (MIN_TIMESTAMP..END_TIMESTAMP).contains(&timestamp) {
-        Ok(timestamp)
-    } else {
-        Err(ShiftError::TimestampOutOfRange)
-    }
-}
-
-/// The `chrono` timestamp of one PostgreSQL holds.
-pub(crate) fn chrono_timestamp(timestamp: i64) -> Result<NaiveDateTime, ShiftError> {
-    let days = timestamp.div_euclid(USECS_PER_DAY) + POSTGRES_EPOCH_JDATE - JULIAN_BEFORE_CE;
-    let date = i32::try_from(days)
-        .ok()
-        .and_then(NaiveDate::from_num_days_from_ce_opt)
-        .ok_or(ShiftError::Unrepresentable)?;
-    Ok(date.and_time(wrap_time(timestamp)))
-}
-
-/// `timestamp2tm`, the year, month, day and clock of a valid timestamp.
-fn timestamp2tm(timestamp: i64) -> (i32, i32, i32, i64) {
-    let julian = timestamp.div_euclid(USECS_PER_DAY) + POSTGRES_EPOCH_JDATE;
-    // A valid timestamp lies between Julian days 0 and 109203528.
-    let julian = i32::try_from(julian).expect("a valid timestamp's Julian day fits int");
-    let (year, month, day) = j2date(julian);
-    (year, month, day, timestamp.rem_euclid(USECS_PER_DAY))
-}
-
-/// `tm2timestamp`, refusing a date before Julian day 0 or a timestamp out of range.
-fn tm2timestamp(year: i32, month: i32, day: i32, clock: i64) -> Result<i64, ShiftError> {
-    // `IS_VALID_JULIAN`, which keeps `date2j` from overflowing.
-    let valid_julian = (year > -4713 || (year == -4713 && month >= 11))
-        && (year < 5_874_898 || (year == 5_874_898 && month < 6));
-    if !valid_julian {
-        return Err(ShiftError::TimestampOutOfRange);
-    }
-    let days = i64::from(date2j(year, month, day)) - POSTGRES_EPOCH_JDATE;
-    days.checked_mul(USECS_PER_DAY)
-        .and_then(|micros| micros.checked_add(clock))
-        .filter(|timestamp| (MIN_TIMESTAMP..END_TIMESTAMP).contains(timestamp))
-        .ok_or(ShiftError::TimestampOutOfRange)
-}
-
-/// `date2j`, the Julian day of a proleptic Gregorian date within `IS_VALID_JULIAN`.
-const fn date2j(year: i32, month: i32, day: i32) -> i32 {
-    let (year, month) = if month > 2 {
-        (year + 4800, month + 1)
-    } else {
-        (year + 4799, month + 13)
-    };
-    let century = year / 100;
-    let mut julian = year * 365 - 32_167;
-    julian += year / 4 - century + century / 4;
-    julian + 7_834 * month / 256 + day
-}
-
-/// `j2date`, the proleptic Gregorian date of a Julian day from 0.
-const fn j2date(julian_day: i32) -> (i32, i32, i32) {
-    // Unsigned as in C, where every intermediate stays below 2^32.
-    let mut julian = julian_day.cast_unsigned() + 32_044;
-    let mut quad = julian / 146_097;
-    let extra = (julian - quad * 146_097) * 4 + 3;
-    julian += 60 + quad * 3 + extra / 146_097;
-    quad = julian / 1_461;
-    julian -= quad * 1_461;
-    let mut year = julian * 4 / 1_461;
-    julian = if year == 0 {
-        (julian + 306) % 366
-    } else {
-        (julian + 305) % 365
-    } + 123;
-    year += quad * 4;
-    let quad = julian * 2_141 / 65_536;
-    let day = julian - 7_834 * quad / 256;
-    let month = (quad + 10) % 12 + 1;
-    // The year is below 2^31 + 4800 and the day and month below 32.
-    (
-        year.cast_signed() - 4_800,
-        month.cast_signed(),
-        day.cast_signed(),
-    )
-}
-
-/// Days in `month` of the proleptic Gregorian `year`, `0` being 1 BC.
-const fn days_in_month(year: i32, month: i32) -> i32 {
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    }
+fn wrap_time(moved: i64) -> PgTime {
+    PgTime::from_micros(moved.rem_euclid(USECS_PER_DAY)).expect("a clock within the day is a time")
 }
 
 /// The running state of PostgreSQL's `sum(interval)` and `avg(interval)`.

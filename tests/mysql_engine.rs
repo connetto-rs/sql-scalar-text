@@ -5,10 +5,12 @@ mod exit_slot;
 #[path = "support/fractional_matrix.rs"]
 mod fractional_matrix;
 
-use chrono::{NaiveDate, NaiveTime};
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use sql_values::{parse_bool, parse_date, parse_f64, parse_i64, parse_time, parse_timestamp};
+use sql_values::{
+    PgDate, PgTime, PgTimestamp, parse_bool, parse_date, parse_f64, parse_i64, parse_time,
+    parse_timestamp,
+};
 use testcontainers::{
     GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -91,7 +93,7 @@ fn mysql_timestamp_fractional_precision_matrix() {
 #[test]
 fn mysql_year_zero() {
     let mut conn = mysql_conn();
-    let year_zero = NaiveDate::from_ymd_opt(0, 1, 1).unwrap();
+    let year_zero = PgDate::from_ymd(0, 1, 1).unwrap();
 
     let text = mysql_text(&mut conn, "CAST(CAST('0000-01-01' AS DATE) AS CHAR)");
     assert_eq!(parse_date(&text), Some(year_zero), "{text:?}");
@@ -100,7 +102,8 @@ fn mysql_year_zero() {
         &mut conn,
         "CAST(CAST('0000-01-01 12:00:00' AS DATETIME) AS CHAR)",
     );
-    let expected = year_zero.and_hms_opt(12, 0, 0).unwrap();
+    let expected =
+        PgTimestamp::new(year_zero, PgTime::from_hms_micro(12, 0, 0, 0).unwrap()).unwrap();
     assert_eq!(parse_timestamp(&text), Some(expected), "{text:?}");
 }
 
@@ -110,11 +113,11 @@ fn mysql_date_and_time_cast_as_char() {
 
     let date_text = mysql_text(&mut conn, "CAST(DATE'2024-03-15' AS CHAR)");
     let got_date = parse_date(&date_text).unwrap_or_else(|| panic!("parse_date: {date_text:?}"));
-    assert_eq!(got_date, NaiveDate::from_ymd_opt(2024, 3, 15).unwrap());
+    assert_eq!(got_date, PgDate::from_ymd(2024, 3, 15).unwrap());
 
     let time_text = mysql_text(&mut conn, "CAST(TIME'14:05:06' AS CHAR)");
     let got_time = parse_time(&time_text).unwrap_or_else(|| panic!("parse_time: {time_text:?}"));
-    assert_eq!(got_time, NaiveTime::from_hms_opt(14, 5, 6).unwrap());
+    assert_eq!(got_time, PgTime::from_hms_micro(14, 5, 6, 0).unwrap());
 
     let frac_time_text = mysql_text(
         &mut conn,
@@ -124,7 +127,7 @@ fn mysql_date_and_time_cast_as_char() {
         .unwrap_or_else(|| panic!("parse_time fractional: {frac_time_text:?}"));
     assert_eq!(
         got_frac,
-        NaiveTime::from_hms_micro_opt(14, 5, 6, 123_456).unwrap(),
+        PgTime::from_hms_micro(14, 5, 6, 123_456).unwrap(),
         "frac time text={frac_time_text:?}"
     );
 }

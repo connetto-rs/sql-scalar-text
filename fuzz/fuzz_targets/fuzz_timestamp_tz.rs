@@ -5,9 +5,8 @@ mod date_spellings;
 #[path = "time_spellings.rs"]
 mod time_spellings;
 
-use chrono::FixedOffset;
 use libfuzzer_sys::fuzz_target;
-use sql_values::{parse_timestamp, parse_timestamp_tz};
+use sql_values::{parse_timestamp, parse_timestamp_tz, PgTimestamp};
 
 /// Zero, whole-hour, half-hour and local-mean-time offsets, the last as PostgreSQL prints it.
 const OFFSETS: [i32; 5] = [
@@ -45,15 +44,22 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     for seconds in OFFSETS {
-        let offset = FixedOffset::east_opt(seconds).expect("offset within a day");
-        let Some(local) = parsed.naive_utc().checked_add_offset(offset) else {
+        let Some(shifted) = parsed.pg_micros().checked_add(i64::from(seconds) * 1_000_000) else {
             continue;
         };
+        let Some(local) = PgTimestamp::from_pg_micros(shifted) else {
+            continue;
+        };
+        // An infinity has no local clock to spell.
+        let Some(time) = local.time() else {
+            continue;
+        };
+        let date = local.date();
         let offsets = offset_spellings(seconds);
-        let times = time_spellings::time_spellings(local.time());
-        for (date, era) in date_spellings::date_spellings(local.date()) {
-            for time in &times {
-                let naive = format!("{date} {time}{era}");
+        let times = time_spellings::time_spellings(time);
+        for (date_body, era) in date_spellings::date_spellings(date) {
+            for t in &times {
+                let naive = format!("{date_body} {t}{era}");
                 assert_eq!(
                     parse_timestamp(&naive),
                     Some(local),
@@ -61,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
                 );
                 for separator in [' ', 'T'] {
                     for zone in &offsets {
-                        let spelling = format!("{date}{separator}{time}{zone}{era}");
+                        let spelling = format!("{date_body}{separator}{t}{zone}{era}");
                         assert_eq!(
                             parse_timestamp_tz(&spelling),
                             Some(parsed),
