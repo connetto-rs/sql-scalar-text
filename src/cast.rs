@@ -662,6 +662,7 @@ fn datetime_error(error: DateTimeError) -> CastError {
         DateTimeError::TimestampOutOfRange => CastError::TimestampOutOfRange,
         DateTimeError::OutsideJiffRange
         | DateTimeError::NeedsTimeZone
+        | DateTimeError::TimeZoneNotRecognized
         | DateTimeError::Unsupported => CastError::Unsupported,
     }
 }

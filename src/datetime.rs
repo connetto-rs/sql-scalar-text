@@ -54,9 +54,13 @@ pub enum DateTimeError {
     /// [`InputContext`].
     #[error("the literal needs a time zone to read as timestamp with time zone")]
     NeedsTimeZone,
+    /// An abbreviation whose set names a zone that does not exist.
+    #[error("time zone not recognized")]
+    TimeZoneNotRecognized,
     /// A spelling this crate does not model. The readers take the ISO spelling
-    /// `YYYY-MM-DD[( |T)HH:MM[:SS[.f]][offset]][ BC]` that no `DateStyle` changes, and the special
-    /// words that need no clock.
+    /// `YYYY-MM-DD[( |T)HH:MM[:SS[.f]][offset]]` that no `DateStyle` changes, followed by a zone
+    /// abbreviation or all-letter zone name and ` BC` or ` AD`, and the special words that need
+    /// no clock.
     #[error("date/time spelling not modelled")]
     Unsupported,
 }
@@ -531,6 +535,21 @@ pub(crate) fn local_offset(zone: &PgTimeZone, local: i64) -> Result<i32, DateTim
             DateTimeError::TimestampOutOfRange
         },
     )
+}
+
+/// `DetermineTimeZoneAbbrevOffset`, the offset the uppercased `abbreviation` had in `zone` at the
+/// local clock `local`, microseconds from 2000-01-01, or the zone's own offset there when the
+/// zone never used it.
+pub(crate) fn abbreviation_offset(
+    zone: &PgTimeZone,
+    abbreviation: &str,
+    local: i64,
+) -> Result<i32, DateTimeError> {
+    let zone_offset = local_offset(zone, local)?;
+    let unix = local.div_euclid(USECS_PER_SEC) + UNIX_TO_POSTGRES_SECS - i64::from(zone_offset);
+    Ok(zone
+        .interpret_abbreviation(abbreviation, unix)?
+        .map_or(zone_offset, |meaning| meaning.offset))
 }
 
 /// `IS_VALID_TIMESTAMP`.
