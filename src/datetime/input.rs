@@ -1,26 +1,20 @@
-//! PostgreSQL 18's `date_in`, `time_in`, `timetz_in`, `timestamp_in` and `timestamptz_in` for the
-//! ISO spelling, and the readers of the text PostgreSQL, MySQL and SQLite print.
-
-use alloc::{string::String, vec::Vec};
+//! PostgreSQL 18's `date_in`, `time_in`, `timetz_in`, `timestamp_in` and `timestamptz_in`, and
+//! the readers of the text PostgreSQL, MySQL and SQLite print.
 
 use super::{
     DateTimeError, POSTGRES_EPOCH_JDATE, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz,
     USECS_PER_DAY, USECS_PER_HOUR, USECS_PER_MINUTE, USECS_PER_SEC, abbreviation_offset, date2j,
     days_in_month, is_valid_julian, local_offset, tm2timestamp,
 };
-use crate::{
-    PgTimeZone, TimeZoneAbbreviations,
-    cast::{is_pg_space, trim_pg_space},
-    float::{round_ties_even, truncate_to_i64},
-    interval::date_word_era,
-    zone::{DEFAULT_ABBREVIATIONS, Meaning},
+use super::{
+    decode::{
+        DateOrder, DateType, DecodedTime, Dterr, Tm, ZoneSource, current_time, decode_date_time,
+        decode_time_only,
+    },
+    tokens::{Tokens, parse_date_time, parse_fractional_second, strtoint},
 };
+use crate::{PgTimeZone, PgType, TimeZoneAbbreviations, zone::DEFAULT_ABBREVIATIONS};
 
-/// `MAX_TZDISP_HOUR`, the largest hour of an offset a literal writes.
-const MAX_TZDISP_HOUR: i32 = 15;
-/// The longest literal the readers take, well inside PostgreSQL's `MAXDATELEN` of 128 bytes
-/// for the fields they read.
-const MAX_LITERAL_LEN: usize = 64;
 /// 1970-01-01 00:00:00, `epoch`, in microseconds from 2000-01-01.
 const EPOCH_MICROS: i64 = -946_684_800_000_000;
 /// 1970-01-01, `epoch`, in days from 2000-01-01.
@@ -48,24 +42,28 @@ const EPOCH_DAYS: i32 = -10_957;
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct InputContext<'a> {
-    time_zone: Option<&'a PgTimeZone>,
-    abbreviations: &'a TimeZoneAbbreviations,
+    pub(super) time_zone: Option<&'a PgTimeZone>,
+    pub(super) abbreviations: &'a TimeZoneAbbreviations,
+    pub(super) date_order: Option<DateOrder>,
+    pub(super) now: Option<PgTimestampTz>,
 }
 
 impl<'a> InputContext<'a> {
-    /// A context with no time zone and the `Default` abbreviations, as a stock installation's
-    /// `timezone_abbreviations` names them.
+    /// A context with no time zone, no `DateStyle` order and no current time, and the `Default`
+    /// abbreviations, as a stock installation's `timezone_abbreviations` names them.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             time_zone: None,
             abbreviations: &DEFAULT_ABBREVIATIONS,
+            date_order: None,
+            now: None,
         }
     }
 
-    /// The context with `zone` as the session's `TimeZone`, which reads a `timestamptz` written
-    /// without an offset, and whose own abbreviations a literal may write before those of the
-    /// set.
+    /// The context with `zone` as the session's `TimeZone`, which reads a `timestamptz` or
+    /// `timetz` written without an offset, and whose own abbreviations a literal may write
+    /// before those of the set.
     #[must_use]
     pub const fn with_time_zone(self, zone: &'a PgTimeZone) -> Self {
         Self {
@@ -85,6 +83,28 @@ impl<'a> InputContext<'a> {
             ..self
         }
     }
+
+    /// The context with `order` as the field order of the session's `DateStyle`, which reads a
+    /// date written in numbers alone such as `01/02/2026`.
+    #[must_use]
+    pub const fn with_date_order(self, order: DateOrder) -> Self {
+        Self {
+            date_order: Some(order),
+            ..self
+        }
+    }
+
+    /// The context with `now` as the transaction's start, which `now`, `today`, `tomorrow` and
+    /// `yesterday` read, in the context's time zone, and whose date a `timetz` without a date
+    /// takes its zone's offset on. An infinite `now` reads as
+    /// [`DateTimeError::TimestampOutOfRange`], as no transaction starts at one.
+    #[must_use]
+    pub const fn with_now(self, now: PgTimestampTz) -> Self {
+        Self {
+            now: Some(now),
+            ..self
+        }
+    }
 }
 
 impl Default for InputContext<'_> {
@@ -93,647 +113,328 @@ impl Default for InputContext<'_> {
     }
 }
 
-/// The reserved words `date_in`, `timestamp_in` and `timestamptz_in` read without a clock.
-enum Special {
-    /// `infinity` or `+infinity`, `DTK_LATE`.
-    Late,
-    /// `-infinity`, `DTK_EARLY`.
-    Early,
-    /// `epoch`, `DTK_EPOCH`.
-    Epoch,
-}
+/// `MAXDATELEN`, whose `workbuf` of one byte more bounds a literal's tokens.
+const MAX_DATE_LEN: usize = 128;
 
-/// A literal's fields as `DecodeDateTime` leaves them, already checked.
-struct Fields {
-    /// The proleptic Gregorian year, where year `Y` BC is `1 - Y`.
-    year: i32,
-    month: i32,
-    day: i32,
-    /// The clock in microseconds, up to 24:00:00.
-    clock: i64,
-    /// The offset east of UTC in seconds, when the literal writes one.
-    offset: Option<i32>,
-    /// The zone the literal names, when it writes one.
-    zone: Option<LiteralZone>,
-}
-
-/// What a date and time literal reads as.
-enum Literal {
-    Special(Special),
-    Fields(Fields),
-}
-
-/// A numeric offset as written, its sign and the digits and colons after it, before
-/// `DecodeTimezone` checks it.
-struct RawOffset<'a> {
-    negative: bool,
-    digits: &'a [u8],
-}
-
-/// What a word of a literal reads as, by `DecodeTimezoneAbbrev`, `DecodeSpecial` and
-/// `pg_tzset` in that order.
-enum Word {
-    /// `ad`, `false`, or `bc`, `true`.
-    Era(bool),
-    /// A zone written after the clock.
-    Zone(LiteralZone),
-}
-
-/// A zone a literal writes, by abbreviation or by name.
-#[derive(Clone)]
-enum LiteralZone {
-    /// `TZ` or `DTZ`, a fixed offset east of UTC in seconds.
-    Fixed(i32),
-    /// `DYNTZ`, the uppercased abbreviation's meaning in a zone at the literal's date.
-    Dynamic {
-        zone: PgTimeZone,
-        abbreviation: String,
-    },
-    /// A full zone name, `pg_tzset`.
-    Named(PgTimeZone),
-}
-
-/// A clock as written, before `DecodeTime` checks it.
-struct RawClock<'a> {
-    hour: [u8; 2],
-    minute: [u8; 2],
-    second: Option<[u8; 2]>,
-    /// The fraction from its point, `.` alone included.
-    fraction: Option<&'a [u8]>,
-    offset: Option<RawOffset<'a>>,
-}
-
-/// A byte cursor over a literal.
-struct Scanner<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Scanner<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.at).copied()
-    }
-
-    fn peek_at(&self, ahead: usize) -> Option<u8> {
-        self.bytes.get(self.at + ahead).copied()
-    }
-
-    fn eat(&mut self, byte: u8) -> bool {
-        let found = self.peek() == Some(byte);
-        self.at += usize::from(found);
-        found
-    }
-
-    fn digits(&mut self) -> &'a [u8] {
-        let start = self.at;
-        while self.peek().is_some_and(|b| b.is_ascii_digit()) {
-            self.at += 1;
-        }
-        &self.bytes[start..self.at]
-    }
-
-    fn two_digits(&mut self) -> Option<[u8; 2]> {
-        match (self.peek(), self.peek_at(1)) {
-            (Some(a), Some(b)) if a.is_ascii_digit() && b.is_ascii_digit() => {
-                self.at += 2;
-                Some([a, b])
-            }
-            _ => None,
-        }
-    }
-
-    fn spaces(&mut self) -> usize {
-        let start = self.at;
-        while self.peek().is_some_and(is_pg_space) {
-            self.at += 1;
-        }
-        self.at - start
-    }
-
-    fn is_done(&self) -> bool {
-        self.at == self.bytes.len()
-    }
-
-    /// `HH:MM[:SS[.f]]` and an optional offset after blanks.
-    fn clock(&mut self) -> Option<RawClock<'a>> {
-        let hour = self.two_digits()?;
-        if !self.eat(b':') {
-            return None;
-        }
-        let minute = self.two_digits()?;
-        let mut second = None;
-        let mut fraction = None;
-        if self.eat(b':') {
-            second = Some(self.two_digits()?);
-            if self.peek() == Some(b'.') {
-                let start = self.at;
-                self.at += 1;
-                self.digits();
-                fraction = Some(&self.bytes[start..self.at]);
-            }
-        }
-        if self.peek().is_some_and(|b| b.is_ascii_digit() || b == b'.') {
-            return None;
-        }
-        let before_offset = self.at;
-        self.spaces();
-        let offset = match self.peek() {
-            Some(sign @ (b'+' | b'-')) if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => {
-                self.at += 1;
-                let start = self.at;
-                while self.peek().is_some_and(|b| b.is_ascii_digit() || b == b':') {
-                    self.at += 1;
-                }
-                if matches!(self.peek(), Some(b'.' | b'-')) {
-                    return None;
-                }
-                Some(RawOffset {
-                    negative: sign == b'-',
-                    digits: &self.bytes[start..self.at],
-                })
-            }
-            _ => {
-                self.at = before_offset;
-                None
-            }
-        };
-        Some(RawClock {
-            hour,
-            minute,
-            second,
-            fraction,
-            offset,
-        })
-    }
-
-    /// The words that end a literal, each a run of letters `ParseDateTime` keeps as one token,
-    /// lowercased, or `None` when something else is left.
-    fn words(&mut self) -> Option<Vec<Vec<u8>>> {
-        let mut words = Vec::new();
-        loop {
-            self.spaces();
-            if self.is_done() {
-                return Some(words);
-            }
-            let start = self.at;
-            while self.peek().is_some_and(|b| b.is_ascii_alphabetic()) {
-                self.at += 1;
-            }
-            if self.at == start || !(self.is_done() || self.peek().is_some_and(is_pg_space)) {
-                return None;
-            }
-            words.push(self.bytes[start..self.at].to_ascii_lowercase());
-        }
-    }
-}
-
-/// `strtoint` of decimal digits, `None` on `ERANGE`.
-fn strtoint(digits: &[u8]) -> Option<i32> {
-    digits.iter().try_fold(0i32, |value, &digit| {
-        value.checked_mul(10)?.checked_add(i32::from(digit - b'0'))
-    })
-}
-
-/// The value of two ASCII digits.
-fn two(digits: [u8; 2]) -> i32 {
-    i32::from(digits[0] - b'0') * 10 + i32::from(digits[1] - b'0')
-}
-
-/// `ParseFractionalSecond`, a fraction from its point as whole microseconds, `rint` of the
-/// `double` times a million.
-fn fractional_second(fraction: &[u8]) -> i64 {
-    if fraction.len() == 1 {
-        return 0;
-    }
-    let value: f64 = core::str::from_utf8(fraction)
-        .ok()
-        .and_then(|text| text.parse().ok())
-        .expect("a point and digits read as a double");
-    truncate_to_i64(round_ties_even(value * 1_000_000.0))
-}
-
-impl RawClock<'_> {
-    /// `DecodeTime`'s sanity check, the clock in microseconds with the hour unchecked.
-    fn decode(&self) -> Result<i64, DateTimeError> {
-        let (hour, minute) = (two(self.hour), two(self.minute));
-        let second = self.second.map_or(0, two);
-        let fsec = self.fraction.map_or(0, fractional_second);
-        // A fraction below one rounds to at most a whole second, which PostgreSQL allows.
-        if minute > 59 || second > 60 {
-            return Err(DateTimeError::FieldValueOutOfRange);
-        }
-        Ok(i64::from(hour) * USECS_PER_HOUR
-            + i64::from(minute) * USECS_PER_MINUTE
-            + i64::from(second) * USECS_PER_SEC
-            + fsec)
-    }
-}
-
-/// `time_overflows` on a clock `DecodeTime` accepted, whose minute, second and fraction are each
-/// in range but whose total may pass 24:00:00, as any hour past 24 makes it.
-fn check_time_overflow(clock: i64) -> Result<i64, DateTimeError> {
-    if clock > USECS_PER_DAY {
-        Err(DateTimeError::FieldValueOutOfRange)
-    } else {
-        Ok(clock)
-    }
-}
-
-/// `DecodeTimezone`, the offset east of UTC in seconds.
-fn decode_timezone(offset: &RawOffset<'_>) -> Result<i32, DateTimeError> {
-    let RawOffset { negative, digits } = *offset;
-    // The token starts with a digit, so the hour is never empty.
-    let mut parts = digits.split(|&b| b == b':');
-    let mut field = || match parts.next() {
-        None => Ok(0),
-        Some([]) => Err(DateTimeError::Unsupported),
-        Some(part) => strtoint(part).ok_or(DateTimeError::TimeZoneDisplacementOutOfRange),
-    };
-    let mut hour = field()?;
-    let mut minute = field()?;
-    let second = field()?;
-    if parts.next().is_some() {
-        return Err(DateTimeError::Unsupported);
-    }
-    let colon = digits.contains(&b':');
-    // `strlen(str) > 3` counts the sign, so three or more digits run hours and minutes together.
-    if !colon && digits.len() > 2 {
-        minute = hour % 100;
-        hour /= 100;
-    }
-    if hour > MAX_TZDISP_HOUR || minute >= 60 || second >= 60 {
-        return Err(DateTimeError::TimeZoneDisplacementOutOfRange);
-    }
-    let seconds = (hour * 60 + minute) * 60 + second;
-    Ok(if negative { -seconds } else { seconds })
-}
-
-/// `DecodeTimezoneAbbrev`, then `DecodeSpecial`, then `pg_tzset`, for a lowercased word: an
-/// abbreviation the session's zone uses, then one of the context's set, then a word of
-/// `datetktbl`, then a zone name. Of `datetktbl`'s words only `ad` and `bc` are read here.
-fn classify(word: &[u8], context: InputContext<'_>) -> Result<Word, DateTimeError> {
-    let upper = String::from_utf8_lossy(word).to_ascii_uppercase();
-    if let Some(zone) = context.time_zone
-        && let Some((meaning, fixed)) = zone.abbreviation_is_known(&upper)
-    {
-        return Ok(Word::Zone(if fixed {
-            LiteralZone::Fixed(meaning.offset)
-        } else {
-            LiteralZone::Dynamic {
-                zone: zone.clone(),
-                abbreviation: upper,
-            }
-        }));
-    }
-    match context.abbreviations.lookup(word) {
-        Some(Meaning::Fixed { offset, .. }) => return Ok(Word::Zone(LiteralZone::Fixed(*offset))),
-        Some(Meaning::Zone(name)) => {
-            let zone = PgTimeZone::load(name).ok_or(DateTimeError::TimeZoneNotRecognized)?;
-            return Ok(Word::Zone(LiteralZone::Dynamic {
-                zone,
-                abbreviation: upper,
-            }));
-        }
-        None => {}
-    }
-    match date_word_era(word) {
-        Some(Some(bc)) => Ok(Word::Era(bc)),
-        Some(None) => Err(DateTimeError::Unsupported),
-        None => PgTimeZone::load(&upper)
-            .map(|zone| Word::Zone(LiteralZone::Named(zone)))
-            .ok_or(DateTimeError::Unsupported),
-    }
-}
-
-/// The era and zone a literal's words write, refusing a second of either, or a zone beside a
-/// numeric offset, which PostgreSQL reads as a syntax error.
-fn classify_words(
-    words: &[Vec<u8>],
-    numeric_offset: bool,
-    context: InputContext<'_>,
-) -> Result<(Option<bool>, Option<LiteralZone>), DateTimeError> {
-    let (mut era, mut zone) = (None, None);
-    for word in words {
-        match classify(word, context)? {
-            Word::Era(_) if era.is_some() => return Err(DateTimeError::Unsupported),
-            Word::Era(bc) => era = Some(bc),
-            Word::Zone(_) if zone.is_some() || numeric_offset => {
-                return Err(DateTimeError::Unsupported);
-            }
-            Word::Zone(written) => zone = Some(written),
-        }
-    }
-    Ok((era, zone))
-}
-
-/// `ParseDateTime` and `DecodeDateTime` for the spellings the readers take, the reserved words
-/// that need no clock and `YYYY-MM-DD[( |T)HH:MM[:SS[.f]][offset]]` between blanks, followed
-/// by a zone abbreviation or name and ` BC` or ` AD`, each at most once.
-fn read_date_time(text: &str, context: InputContext<'_>) -> Result<Literal, DateTimeError> {
-    let bytes = trim_pg_space(text.as_bytes());
-    if bytes.len() > MAX_LITERAL_LEN {
-        return Err(DateTimeError::Unsupported);
-    }
-    let special =
-        if bytes.eq_ignore_ascii_case(b"infinity") || bytes.eq_ignore_ascii_case(b"+infinity") {
-            Some(Special::Late)
-        } else if bytes.eq_ignore_ascii_case(b"-infinity") {
-            Some(Special::Early)
-        } else if bytes.eq_ignore_ascii_case(b"epoch") {
-            Some(Special::Epoch)
-        } else {
-            None
-        };
-    if let Some(special) = special {
-        return Ok(Literal::Special(special));
-    }
-
-    let unsupported = DateTimeError::Unsupported;
-    let mut scanner = Scanner::new(bytes);
-    let year = scanner.digits();
-    if year.len() < 4 || (year.len() > 4 && year[0] == b'0') || !scanner.eat(b'-') {
-        return Err(unsupported);
-    }
-    let month = scanner.two_digits().ok_or(unsupported)?;
-    if !scanner.eat(b'-') {
-        return Err(unsupported);
-    }
-    let day = scanner.two_digits().ok_or(unsupported)?;
-    if scanner.peek().is_some_and(|b| b.is_ascii_digit()) {
-        return Err(unsupported);
-    }
-    let after_date = scanner.at;
-    let separated = match scanner.peek() {
-        Some(b'T' | b't') => {
-            scanner.at += 1;
-            true
-        }
-        _ => scanner.spaces() > 0,
-    };
-    let clock = if separated && scanner.peek().is_some_and(|b| b.is_ascii_digit()) {
-        Some(scanner.clock().ok_or(unsupported)?)
-    } else {
-        scanner.at = after_date;
-        None
-    };
-    let words = scanner.words().ok_or(unsupported)?;
-
-    // The checks in `DecodeDateTime`'s order, the date token, the time token, the zone token,
-    // then `ValidateDate`.
-    let year = strtoint(year).ok_or(DateTimeError::FieldValueOutOfRange)?;
-    let (clock, offset) = match clock {
-        None => (0, None),
-        Some(raw) => {
-            let clock = check_time_overflow(raw.decode()?)?;
-            let offset = raw.offset.as_ref().map(decode_timezone).transpose()?;
-            (clock, offset)
-        }
-    };
-    let (era, zone) = classify_words(&words, offset.is_some(), context)?;
-    let bc = era.unwrap_or(false);
-    if year <= 0 {
-        return Err(DateTimeError::FieldValueOutOfRange);
-    }
-    let year = if bc { 1 - year } else { year };
-    let (month, day) = (two(month), two(day));
-    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
-        return Err(DateTimeError::FieldValueOutOfRange);
-    }
-    Ok(Literal::Fields(Fields {
-        year,
-        month,
-        day,
-        clock,
-        offset,
-        zone,
-    }))
-}
-
-/// The offset a time literal writes, as `DecodeTimeOnly` settles it without a date.
-enum TimeOffset {
-    /// No offset, which the session's zone then gives.
-    Unwritten,
-    /// An offset east of UTC in seconds.
-    Known(i32),
-    /// A zone whose offset depends on the date, which the current date then decides.
-    NeedsDate,
-}
-
-/// `DecodeTimeOnly` for the spellings the readers take, `allballs` and `HH:MM[:SS[.f]]` with
-/// an optional offset, followed by a zone abbreviation or name, between blanks. `None` for
-/// `allballs`.
-fn read_time(
+/// `ParseDateTime` and `decoder`, `DecodeDateTime` or `DecodeTimeOnly`, over a literal of
+/// `pg_type`, which a NUL ends as it ends a C string.
+fn decode<'a, T>(
     text: &str,
-    context: InputContext<'_>,
-) -> Result<Option<(i64, TimeOffset)>, DateTimeError> {
-    let bytes = trim_pg_space(text.as_bytes());
-    if bytes.len() > MAX_LITERAL_LEN {
-        return Err(DateTimeError::Unsupported);
+    context: InputContext<'a>,
+    pg_type: PgType,
+    decoder: fn(&Tokens, InputContext<'a>) -> Result<T, Dterr>,
+) -> Result<T, DateTimeError> {
+    let text = text.split('\0').next().unwrap_or_default();
+    let tokens = parse_date_time(text.as_bytes(), MAX_DATE_LEN + 1)
+        .map_err(|_| DateTimeError::InvalidInputSyntax(pg_type))?;
+    decoder(&tokens, context).map_err(|error| error.for_type(pg_type))
+}
+
+/// `read` under the context's `DateStyle` order. Without one, a literal the order touches reads
+/// only if every order reads it alike, as `January 8, 1999` does.
+fn by_date_order<'a, T: PartialEq>(
+    context: InputContext<'a>,
+    read: impl Fn(InputContext<'a>) -> Result<T, DateTimeError>,
+) -> Result<T, DateTimeError> {
+    match read(context) {
+        Err(DateTimeError::NeedsDateOrder) => {
+            let [mdy, dmy, ymd] = [DateOrder::Mdy, DateOrder::Dmy, DateOrder::Ymd]
+                .map(|order| read(context.with_date_order(order)));
+            if mdy == dmy && dmy == ymd {
+                mdy
+            } else {
+                Err(DateTimeError::NeedsDateOrder)
+            }
+        }
+        other => other,
     }
-    if bytes.eq_ignore_ascii_case(b"allballs") {
-        return Ok(None);
+}
+
+/// The local clock of `tm` to the second, as `DetermineTimeZoneOffset` reads it, in microseconds
+/// from 2000-01-01, or `None` where that overflows.
+fn local_seconds(tm: &Tm) -> Option<i64> {
+    let days = i64::from(date2j(tm.year, tm.mon, tm.mday)) - i64::from(POSTGRES_EPOCH_JDATE);
+    let clock = (i64::from(tm.hour) * 60 + i64::from(tm.min)) * 60 + i64::from(tm.sec);
+    days.checked_mul(USECS_PER_DAY)?
+        .checked_add(clock * USECS_PER_SEC)
+}
+
+/// `DetermineTimeZoneOffset` and `DetermineTimeZoneAbbrevOffset` for a `timetz`, whose date
+/// may lie anywhere `ValidateDate` accepts. Outside `IS_VALID_JULIAN` PostgreSQL takes UTC and
+/// reads the abbreviation at the Unix epoch, and a date it can place that jiff cannot is
+/// [`DateTimeError::OutsideJiffRange`].
+fn time_zone_offset(
+    zone: &PgTimeZone,
+    abbreviation: Option<&str>,
+    tm: &Tm,
+) -> Result<i32, DateTimeError> {
+    if !is_valid_julian(tm.year, tm.mon) {
+        return match abbreviation {
+            Some(abbreviation) => Ok(zone
+                .interpret_abbreviation(abbreviation, 0)?
+                .map_or(0, |meaning| meaning.offset)),
+            None => Ok(0),
+        };
     }
-    let mut scanner = Scanner::new(bytes);
-    let raw = scanner.clock().ok_or(DateTimeError::Unsupported)?;
-    let words = scanner.words().ok_or(DateTimeError::Unsupported)?;
-    let clock = raw.decode()?;
-    let offset = raw.offset.as_ref().map(decode_timezone).transpose()?;
-    let (era, zone) = classify_words(&words, offset.is_some(), context)?;
-    if era.is_some() {
-        return Err(DateTimeError::Unsupported);
+    let local = local_seconds(tm).ok_or(DateTimeError::OutsideJiffRange)?;
+    match abbreviation {
+        Some(abbreviation) => abbreviation_offset(zone, abbreviation, local),
+        None => local_offset(zone, local),
     }
-    let offset = match (offset, zone) {
-        (Some(offset), _) | (None, Some(LiteralZone::Fixed(offset))) => TimeOffset::Known(offset),
-        (None, Some(LiteralZone::Named(zone))) => zone
-            .fixed_offset()
-            .map_or(TimeOffset::NeedsDate, TimeOffset::Known),
-        (None, Some(LiteralZone::Dynamic { .. })) => TimeOffset::NeedsDate,
-        (None, None) => TimeOffset::Unwritten,
-    };
-    Ok(Some((check_time_overflow(clock)?, offset)))
+    .map_err(|_| DateTimeError::OutsideJiffRange)
 }
 
 impl PgDate {
-    /// PostgreSQL's `date_in`, reading the ISO spelling and `infinity`, `-infinity` and `epoch`,
-    /// with a clock and offset read, checked and ignored.
+    /// PostgreSQL's `date_in`, reading every spelling `DecodeDateTime` reads, with a clock and
+    /// zone read, checked and ignored.
     ///
     /// # Errors
     ///
-    /// The [`DateTimeError`] PostgreSQL raises, or [`DateTimeError::Unsupported`] for another
-    /// spelling.
+    /// The [`DateTimeError`] PostgreSQL raises, or the session state the literal needs and the
+    /// context lacks, [`DateTimeError::NeedsDateOrder`], [`DateTimeError::NeedsCurrentTime`] or
+    /// [`DateTimeError::NeedsTimeZone`].
     ///
     /// ```
-    /// use sql_values::{DateTimeError, InputContext, PgDate};
+    /// use sql_values::{DateOrder, DateTimeError, InputContext, PgDate, PgType};
     ///
-    /// let read = |text| PgDate::parse(text, InputContext::new()).map(|d| d.to_string());
-    /// assert_eq!(read("5874897-12-31").unwrap(), "5874897-12-31");
-    /// assert_eq!(read(" -Infinity ").unwrap(), "-infinity");
-    /// assert_eq!(read("2024-02-30"), Err(DateTimeError::FieldValueOutOfRange));
-    /// assert_eq!(read("4714-11-23 BC"), Err(DateTimeError::DateOutOfRange));
+    /// let read = |text, context| PgDate::parse(text, context).map(|d| d.to_string());
+    /// let context = InputContext::new();
+    /// assert_eq!(read("5874897-12-31", context).unwrap(), "5874897-12-31");
+    /// assert_eq!(read("January 8, 1999 BC", context).unwrap(), "1999-01-08 BC");
+    /// assert_eq!(read("J2451545", context).unwrap(), "2000-01-01");
+    /// // Under `YMD` a short number after a month name is the year, which `99` can be.
+    /// assert_eq!(read("January 8, 99", context), Err(DateTimeError::NeedsDateOrder));
+    /// assert_eq!(read("2024-02-30", context), Err(DateTimeError::FieldValueOutOfRange));
+    /// assert_eq!(read("nope", context), Err(DateTimeError::InvalidInputSyntax(PgType::Date)));
+    /// assert_eq!(read("01/02/2026", context), Err(DateTimeError::NeedsDateOrder));
+    /// let dmy = context.with_date_order(DateOrder::Dmy);
+    /// assert_eq!(read("01/02/2026", dmy).unwrap(), "2026-02-01");
     /// ```
     pub fn parse(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
-        let fields = match read_date_time(text, context)? {
-            Literal::Special(Special::Late) => return Ok(Self::INFINITY),
-            Literal::Special(Special::Early) => return Ok(Self::NEG_INFINITY),
-            Literal::Special(Special::Epoch) => return Ok(Self(EPOCH_DAYS)),
-            Literal::Fields(fields) => fields,
+        by_date_order(context, |context| Self::read(text, context))
+    }
+
+    /// [`Self::parse`] under the context's order alone.
+    fn read(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
+        let decoded = decode(text, context, PgType::Date, decode_date_time)?;
+        let tm = match decoded.dtype {
+            DateType::Date => decoded.tm,
+            DateType::Epoch => return Ok(Self(EPOCH_DAYS)),
+            DateType::Late => return Ok(Self::INFINITY),
+            DateType::Early => return Ok(Self::NEG_INFINITY),
         };
-        if !is_valid_julian(fields.year, fields.month) {
+        if !is_valid_julian(tm.year, tm.mon) {
             return Err(DateTimeError::DateOutOfRange);
         }
-        Self::from_pg_days(date2j(fields.year, fields.month, fields.day) - POSTGRES_EPOCH_JDATE)
+        Self::from_pg_days(date2j(tm.year, tm.mon, tm.mday) - POSTGRES_EPOCH_JDATE)
             .filter(|date| date.is_finite())
             .ok_or(DateTimeError::DateOutOfRange)
     }
 }
 
 impl PgTimestamp {
-    /// PostgreSQL's `timestamp_in`, reading the ISO spelling and `infinity`, `-infinity` and
-    /// `epoch`, with an offset read, checked and ignored.
+    /// PostgreSQL's `timestamp_in`, reading every spelling `DecodeDateTime` reads, with a zone
+    /// read, checked and ignored.
     ///
     /// # Errors
     ///
-    /// The [`DateTimeError`] PostgreSQL raises, or [`DateTimeError::Unsupported`] for another
-    /// spelling.
+    /// The [`DateTimeError`] PostgreSQL raises, or the session state the literal needs and the
+    /// context lacks.
     ///
     /// ```
     /// use sql_values::{DateTimeError, InputContext, PgTimestamp};
     ///
     /// let read = |text| PgTimestamp::parse(text, InputContext::new()).map(|t| t.to_string());
     /// assert_eq!(read("2024-12-31 24:00:00").unwrap(), "2025-01-01 00:00:00");
-    /// assert_eq!(read("4714-11-24 00:00:00 BC").unwrap(), "4714-11-24 00:00:00 BC");
+    /// assert_eq!(read("Jan 1999 08 04:05:06 PM").unwrap(), "1999-01-08 16:05:06");
+    /// assert_eq!(read("19990108T040506.5").unwrap(), "1999-01-08 04:05:06.5");
     /// assert_eq!(read("294277-01-01"), Err(DateTimeError::TimestampOutOfRange));
     /// ```
     pub fn parse(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
-        match read_date_time(text, context)? {
-            Literal::Special(Special::Late) => Ok(Self::INFINITY),
-            Literal::Special(Special::Early) => Ok(Self::NEG_INFINITY),
-            Literal::Special(Special::Epoch) => Ok(Self(EPOCH_MICROS)),
-            Literal::Fields(fields) => {
-                tm2timestamp(fields.year, fields.month, fields.day, fields.clock, 0)
+        by_date_order(context, |context| Self::read(text, context))
+    }
+
+    /// [`Self::parse`] under the context's order alone.
+    fn read(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
+        let decoded = decode(text, context, PgType::Timestamp, decode_date_time)?;
+        match decoded.dtype {
+            DateType::Date => {
+                let tm = decoded.tm;
+                tm2timestamp(tm.year, tm.mon, tm.mday, tm.clock(), 0)
                     .map(Self)
                     .ok_or(DateTimeError::TimestampOutOfRange)
             }
+            DateType::Epoch => Ok(Self(EPOCH_MICROS)),
+            DateType::Late => Ok(Self::INFINITY),
+            DateType::Early => Ok(Self::NEG_INFINITY),
         }
     }
 }
 
 impl PgTimestampTz {
-    /// PostgreSQL's `timestamptz_in`, reading the ISO spelling and `infinity`, `-infinity` and
-    /// `epoch`. A zone the literal names, or else the context's time zone, decides the offset of
-    /// a literal without a numeric one, its local clock resolved as
-    /// [`PgTimestamp::to_timestamptz`] resolves it, and an abbreviation whose meaning changed
-    /// takes the one it had at that clock.
+    /// PostgreSQL's `timestamptz_in`, reading every spelling `DecodeDateTime` reads. A zone the
+    /// literal names, or else the context's time zone, decides the offset of a literal without
+    /// a numeric one, its local clock resolved as [`PgTimestamp::to_timestamptz`] resolves it,
+    /// and an abbreviation whose meaning changed takes the one it had at that clock.
     ///
     /// # Errors
     ///
-    /// The [`DateTimeError`] PostgreSQL raises, [`DateTimeError::NeedsTimeZone`] for a literal
-    /// without an offset or zone and a context without a time zone,
-    /// [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about a clock outside
-    /// jiff's years, or [`DateTimeError::Unsupported`] for another spelling.
+    /// The [`DateTimeError`] PostgreSQL raises, the session state the literal needs and the
+    /// context lacks, or [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about
+    /// a clock outside jiff's years.
     ///
     /// ```
-    /// use sql_values::{DateTimeError, InputContext, PgTimestampTz};
+    /// use sql_values::{DateTimeError, InputContext, PgTimeZone, PgTimestampTz};
     ///
-    /// let read = |text| PgTimestampTz::parse(text, InputContext::new()).map(|t| t.to_string());
-    /// assert_eq!(read("2024-01-01 12:00+15:59:59").unwrap(), "2023-12-31 20:00:01+00");
-    /// assert_eq!(read("2024-01-01 12:00+16"), Err(DateTimeError::TimeZoneDisplacementOutOfRange));
+    /// let read = |text, context| PgTimestampTz::parse(text, context).map(|t| t.to_string());
+    /// let context = InputContext::new();
+    /// assert_eq!(read("2024-01-01 12:00+15:59:59", context).unwrap(), "2023-12-31 20:00:01+00");
+    /// assert_eq!(
+    ///     read("2024-01-01 12:00+16", context),
+    ///     Err(DateTimeError::TimeZoneDisplacementOutOfRange),
+    /// );
     /// // `MSK` follows Europe/Moscow, which kept +04 from 2011 to 2014.
-    /// assert_eq!(read("2012-01-01 12:00 MSK").unwrap(), "2012-01-01 08:00:00+00");
-    /// assert_eq!(read("2015-01-01 12:00 MSK").unwrap(), "2015-01-01 09:00:00+00");
+    /// assert_eq!(read("2012-01-01 12:00 MSK", context).unwrap(), "2012-01-01 08:00:00+00");
+    /// assert_eq!(read("2015-01-01 12:00 MSK", context).unwrap(), "2015-01-01 09:00:00+00");
+    /// assert_eq!(read("2026-07-01 12:00 Europe/Rome", context).unwrap(), "2026-07-01 10:00:00+00");
+    /// assert_eq!(read("now", context), Err(DateTimeError::NeedsCurrentTime));
+    /// let rome = PgTimeZone::parse("Europe/Rome").unwrap();
+    /// let start = PgTimestampTz::parse("2026-07-01 23:30+00", context).unwrap();
+    /// let session = context.with_time_zone(&rome).with_now(start);
+    /// assert_eq!(read("today", session).unwrap(), "2026-07-01 22:00:00+00");
     /// ```
     pub fn parse(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
-        let fields = match read_date_time(text, context)? {
-            Literal::Special(Special::Late) => return Ok(Self::INFINITY),
-            Literal::Special(Special::Early) => return Ok(Self::NEG_INFINITY),
-            Literal::Special(Special::Epoch) => return Ok(Self(EPOCH_MICROS)),
-            Literal::Fields(fields) => fields,
+        by_date_order(context, |context| Self::read(text, context))
+    }
+
+    /// [`Self::parse`] under the context's order alone.
+    fn read(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
+        let decoded = decode(text, context, PgType::TimestampTz, decode_date_time)?;
+        let tm = match decoded.dtype {
+            DateType::Date => decoded.tm,
+            DateType::Epoch => return Ok(Self(EPOCH_MICROS)),
+            DateType::Late => return Ok(Self::INFINITY),
+            DateType::Early => return Ok(Self::NEG_INFINITY),
         };
         let out_of_range = DateTimeError::TimestampOutOfRange;
         // The local clock as microseconds from 2000-01-01, for a zone to resolve.
         let local = || {
-            if !is_valid_julian(fields.year, fields.month) {
+            if !is_valid_julian(tm.year, tm.mon) {
                 return Err(out_of_range);
             }
-            let days = i64::from(date2j(fields.year, fields.month, fields.day))
-                - i64::from(POSTGRES_EPOCH_JDATE);
+            let days =
+                i64::from(date2j(tm.year, tm.mon, tm.mday)) - i64::from(POSTGRES_EPOCH_JDATE);
             days.checked_mul(USECS_PER_DAY)
-                .and_then(|micros| micros.checked_add(fields.clock))
+                .and_then(|micros| micros.checked_add(tm.clock()))
                 .ok_or(out_of_range)
         };
-        let offset = match (fields.offset, &fields.zone, context.time_zone) {
-            (Some(offset), _, _) => offset,
-            (None, Some(LiteralZone::Fixed(offset)), _) => *offset,
-            (None, Some(LiteralZone::Dynamic { zone, abbreviation }), _) => {
-                abbreviation_offset(zone, abbreviation, local()?)?
-            }
-            (None, Some(LiteralZone::Named(zone)), _) | (None, None, Some(zone)) => {
+        let offset = match &decoded.zone {
+            ZoneSource::West(west) => -*west,
+            ZoneSource::Abbreviation { zone, upper } => abbreviation_offset(zone, upper, local()?)?,
+            ZoneSource::Named(zone) => local_offset(zone, local()?)?,
+            ZoneSource::Session => {
+                let zone = context.time_zone.ok_or(DateTimeError::NeedsTimeZone)?;
                 local_offset(zone, local()?)?
             }
-            (None, None, None) => return Err(DateTimeError::NeedsTimeZone),
         };
-        tm2timestamp(fields.year, fields.month, fields.day, fields.clock, offset)
+        tm2timestamp(tm.year, tm.mon, tm.mday, tm.clock(), offset)
             .map(Self)
             .ok_or(out_of_range)
     }
 }
 
 impl PgTime {
-    /// PostgreSQL's `time_in`, reading `HH:MM[:SS[.f]]` up to 24:00:00 and `allballs`, with an
-    /// offset read, checked and ignored, and the fraction rounded to the microsecond.
+    /// PostgreSQL's `time_in`, reading every spelling `DecodeTimeOnly` reads, with a date and
+    /// zone read, checked and ignored, and the fraction rounded to the microsecond.
     ///
     /// # Errors
     ///
-    /// The [`DateTimeError`] PostgreSQL raises, or [`DateTimeError::Unsupported`] for another
-    /// spelling.
+    /// The [`DateTimeError`] PostgreSQL raises, or the session state the literal needs and the
+    /// context lacks.
     ///
     /// ```
-    /// use sql_values::{DateTimeError, InputContext, PgTime};
+    /// use sql_values::{DateTimeError, InputContext, PgTime, PgType};
     ///
     /// let read = |text| PgTime::parse(text, InputContext::new()).map(|t| t.to_string());
     /// assert_eq!(read("23:59:60").unwrap(), "24:00:00");
     /// assert_eq!(read("12:00:00.1234565").unwrap(), "12:00:00.123456");
+    /// assert_eq!(read("040506.5 PM").unwrap(), "16:05:06.5");
+    /// assert_eq!(read("T12:00 Europe/Rome"), Err(DateTimeError::InvalidInputSyntax(PgType::Time)));
+    /// assert_eq!(read("2026-07-01 12:00 Europe/Rome").unwrap(), "12:00:00");
     /// assert_eq!(read("24:00:00.000001"), Err(DateTimeError::FieldValueOutOfRange));
     /// ```
     pub fn parse(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
-        Ok(Self(
-            read_time(text, context)?.map_or(0, |(clock, _)| clock),
-        ))
+        by_date_order(context, |context| Self::read(text, context))
+    }
+
+    /// [`Self::parse`] under the context's order alone.
+    fn read(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
+        let decoded = decode(text, context, PgType::Time, decode_time_only)?;
+        Ok(Self(decoded.tm.clock()))
     }
 }
 
 impl PgTimeTz {
-    /// PostgreSQL's `timetz_in`, reading `HH:MM[:SS[.f]]` up to 24:00:00 with an offset or a
-    /// zone of one fixed offset, and `allballs`. A time without an offset, or with a zone whose
-    /// offset changes, takes the offset of the current date, which this reader does not model.
+    /// PostgreSQL's `timetz_in`, reading every spelling `DecodeTimeOnly` reads. A time without
+    /// an offset, or with a zone whose offset changes, takes the zone's offset on the date the
+    /// literal writes, or else on the current date in the context's time zone.
     ///
     /// # Errors
     ///
-    /// The [`DateTimeError`] PostgreSQL raises, or [`DateTimeError::Unsupported`] for another
-    /// spelling or a time whose offset the current date decides.
+    /// The [`DateTimeError`] PostgreSQL raises, the session state the literal needs and the
+    /// context lacks, or [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about
+    /// a date outside jiff's years.
     ///
     /// ```
-    /// use sql_values::{InputContext, PgTimeTz};
+    /// use sql_values::{DateTimeError, InputContext, PgTimeTz, PgTimeZone, PgTimestampTz};
     ///
-    /// let read = |text| PgTimeTz::parse(text, InputContext::new()).map(|t| t.to_string());
-    /// assert_eq!(read("12:00:00-05:30").unwrap(), "12:00:00-05:30");
-    /// assert_eq!(read("allballs").unwrap(), "00:00:00+00");
+    /// let read = |text, context| PgTimeTz::parse(text, context).map(|t| t.to_string());
+    /// let context = InputContext::new();
+    /// assert_eq!(read("12:00:00-05:30", context).unwrap(), "12:00:00-05:30");
+    /// assert_eq!(read("allballs", context).unwrap(), "00:00:00+00");
+    /// assert_eq!(read("2026-07-01 12:00 Europe/Rome", context).unwrap(), "12:00:00+02");
+    /// assert_eq!(read("12:00", context), Err(DateTimeError::NeedsCurrentTime));
+    /// let rome = PgTimeZone::parse("Europe/Rome").unwrap();
+    /// let start = PgTimestampTz::parse("2026-01-15 12:00+00", context).unwrap();
+    /// let session = context.with_time_zone(&rome).with_now(start);
+    /// assert_eq!(read("12:00", session).unwrap(), "12:00:00+01");
     /// ```
     pub fn parse(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
-        match read_time(text, context)? {
-            None => Ok(Self { time: 0, offset: 0 }),
-            Some((clock, TimeOffset::Known(offset))) => Ok(Self {
-                time: clock,
-                offset,
-            }),
-            Some((_, TimeOffset::Unwritten | TimeOffset::NeedsDate)) => {
-                Err(DateTimeError::Unsupported)
+        by_date_order(context, |context| Self::read(text, context))
+    }
+
+    /// [`Self::parse`] under the context's order alone.
+    fn read(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
+        let pg_type = PgType::TimeTz;
+        let DecodedTime { tm, dated, zone } = decode(text, context, pg_type, decode_time_only)?;
+        // The literal's date, or the current one, at the literal's clock.
+        let at = || {
+            let mut at = if dated {
+                tm
+            } else {
+                current_time(context)
+                    .map_err(|error| error.for_type(pg_type))?
+                    .0
+            };
+            (at.hour, at.min, at.sec) = (tm.hour, tm.min, tm.sec);
+            Ok::<_, DateTimeError>(at)
+        };
+        let offset = match &zone {
+            ZoneSource::West(west) => -*west,
+            ZoneSource::Named(zone) => time_zone_offset(zone, None, &tm)?,
+            ZoneSource::Abbreviation { zone, upper } => {
+                time_zone_offset(zone, Some(upper), &at()?)?
             }
-        }
+            ZoneSource::Session => {
+                let at = at()?;
+                let zone = context.time_zone.ok_or(DateTimeError::NeedsTimeZone)?;
+                time_zone_offset(zone, None, &at)?
+            }
+        };
+        Ok(Self {
+            time: tm.clock(),
+            offset,
+        })
     }
 }
 
@@ -848,8 +549,11 @@ fn parse_date_prefix(bytes: &[u8], bc: bool) -> Option<(Ymd, &[u8])> {
     if year_len < 4 || (year_len > 4 && bytes[0] == b'0') {
         return None;
     }
-    let (year_digits, rest) = bytes.split_at(year_len);
-    let year = strtoint(year_digits)?;
+    let (year, _, erange) = strtoint(bytes, 0);
+    if erange {
+        return None;
+    }
+    let rest = &bytes[year_len..];
     let year = match (year, bc) {
         (0, true) => return None,
         (_, true) => 1 - year,
@@ -875,7 +579,8 @@ fn parse_time_prefix(bytes: &[u8]) -> Option<(i64, &[u8])> {
             if !(1..=9).contains(&len) {
                 return None;
             }
-            (fractional_second(&rest[..=len]), &fraction[len..])
+            let fsec = parse_fractional_second(&rest[..=len]).ok()?;
+            (i64::from(fsec), &fraction[len..])
         }
         _ => (0, rest),
     };

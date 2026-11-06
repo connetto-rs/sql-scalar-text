@@ -9,9 +9,9 @@ mod postgres;
 
 use diesel::{dsl::sql, prelude::*, result::Error as DieselError, sql_types::Text};
 use sql_values::{
-    DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimeZone, PgTimestamp, PgTimestampTz,
-    TimeZoneAbbreviations, parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex,
-    parse_time, parse_timestamp, parse_timestamp_tz,
+    DateOrder, DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimeZone, PgTimestamp,
+    PgTimestampTz, TimeZoneAbbreviations, parse_bool, parse_date, parse_f64, parse_i64,
+    parse_pg_bytea_hex, parse_time, parse_timestamp, parse_timestamp_tz,
 };
 
 /// One container per test binary, removed when the binary exits; a plain
@@ -37,13 +37,39 @@ fn pg18_answer(conn: &mut PgConnection, expression: &str) -> Result<String, Stri
     // Raw SQL with the literal inline, so that it reaches the type's input function.
     match diesel::select(sql::<Text>(&format!("format('%s', {expression})"))).get_result(conn) {
         Ok(text) => Ok(text),
-        Err(DieselError::DatabaseError(_, info)) => Err(info
-            .message()
-            .split_once(": \"")
-            .map_or(info.message(), |(stem, _)| stem)
-            .to_owned()),
+        Err(DieselError::DatabaseError(_, info)) => Err(message_stem(info.message())),
         Err(other) => panic!("{expression}: {other}"),
     }
+}
+
+/// [`pg18_answer`] with the transaction's start in UTC, which the statement reads `now` and
+/// the current date at, when the expression reads.
+fn pg18_answer_at_now(
+    conn: &mut PgConnection,
+    expression: &str,
+) -> (Result<String, String>, Option<String>) {
+    // Raw SQL: the value and the transaction's start must come from one statement.
+    let query = format!("format('%s|%s', {expression}, (now() AT TIME ZONE 'UTC'))");
+    match diesel::select(sql::<Text>(&query)).get_result::<String>(conn) {
+        Ok(row) => {
+            let (value, now) = row.split_once('|').expect("two values");
+            (Ok(value.to_owned()), Some(now.to_owned()))
+        }
+        Err(DieselError::DatabaseError(_, info)) => (Err(message_stem(info.message())), None),
+        Err(other) => panic!("{expression}: {other}"),
+    }
+}
+
+/// A PostgreSQL message without the quoted input it appends, and without the zone name
+/// `time zone "Mars/Olympus" not recognized` writes, which the crate's message leaves out.
+fn message_stem(message: &str) -> String {
+    if message.starts_with("time zone \"") && message.ends_with("\" not recognized") {
+        return "time zone not recognized".to_owned();
+    }
+    message
+        .split_once(": \"")
+        .map_or(message, |(stem, _)| stem)
+        .to_owned()
 }
 
 /// `text` quoted as an SQL string literal.
@@ -117,23 +143,190 @@ const TIMES: &[&str] = &[
     "12:00 zulu",
     "12:00 MSK",
     "12:00 factory",
+    "040506",
+    "0405",
+    "040506.789",
+    "040506.5 PM",
+    "04:05:06 PM",
+    "12:00 AM",
+    "12:00 PM",
+    "00:00 AM",
+    "13:00 PM",
+    "24:00:00 PM",
+    "11:59:60 PM",
+    "4 PM",
+    "T040506",
+    "T 04:05",
+    "t12:00",
+    "t 040506",
+    "t 0405",
+    "t 04",
+    "t 040506-08",
+    "h 04:05",
+    "t t 04:05",
+    "12:00 t 040506",
+    "12:00 040506",
+    "12:00 040506-08",
+    "040506-08",
+    "040506-08 PM",
+    "0405-08",
+    "04-08",
+    "040506/08",
+    "abc/def 12:00",
+    "046070",
+    "04:05:06.5.5",
+    "23:59:59.9999999",
+    "12:00 06:00",
+    "12:00 +05 +06",
+    "12:00 +05:99999999999",
+    "12:00 5",
+    "12:00 55555",
+    "12:00 12.5",
+    "12.5",
+    "123.5",
+    "12:00 h 5",
+    "12:00 h",
+    "j 2451187 12:00",
+    "j 2451187.5",
+    "j2451187.25",
+    "12:00 j 99999999999",
+    "12:00 j 2451187",
+    "1999-01-08 04:05:06",
+    "1999-01-08 12:00",
+    "1999-01-08 T12:00",
+    "1999-01-08",
+    "19990108 12:00",
+    "1999.008 12:00",
+    "2026.001 2026-01-01",
+    "Jan 8 1999 12:00",
+    "January 8, 1999 12:00",
+    "99-01-08 12:00",
+    "01/02/03 12:00",
+    "07/01/03 12:00",
+    "1/1 12:00",
+    "12:00 1999-01-08",
+    "04:05:06 1999-01-08",
+    "1999-01-08 12:00 bc",
+    "0-01-08 12:00 bc",
+    "12:00 bc",
+    "12:00 ad",
+    "12:00 at",
+    "12:00 Jan",
+    "12:00 Monday",
+    "now",
+    "today",
+    "tomorrow",
+    "epoch",
+    "infinity",
+    "now 12:00",
+    "now +05",
+    "now Europe/Rome",
+    "allballs dst",
+    "allballs +05",
+    "12:00 dst",
+    "12:00 CET DST",
+    "12:00 +05 dst",
+    "12:00 z dst",
+    "12:00 EST",
+    "12:00 Europe/Rome",
+    "12:00 UTC",
+    "12:00 Etc/GMT+5",
+    "12:00 Japan",
+    "12:00 America/New_York",
+    "12:00 Europe/Nowhere",
+    "12:00 Nowhere",
+    "2026-07-01 12:00 Europe/Rome",
+    "2026-01-15 12:00 Europe/Rome",
+    "2026-07-01 12:00 America/New_York",
+    "1999-01-08 12:00 Europe/Rome dst",
+    "1999-01-08 12:00 Europe/Rome",
+    "2026-07-01 12:00 MSK",
+    "2012-01-15 12:00 MSK",
+    "12:00 MSK dst",
+    "2026-07-01 12:00",
+    "2026-01-15 12:00",
+    "9999-12-31 12:00 Europe/Rome",
+    "4714-11-24 BC 12:00 Europe/Rome",
+    "5874898-06-01 12:00 Europe/Rome",
+    "5874898-06-01 12:00 MSK",
+    "5874898-06-01 12:00",
+    "5874898-06-01 12:00 CEST",
+    "1999-01-08 12:00 +05",
+    "1999-01-08 040506",
+    "1999-01-08 t 040506",
+    "12:00 1999-01-08 Europe/Rome",
+    "040561",
+    "040560",
+    "Europe/Rome",
+    "+05",
+    "PM",
+    "1999-01-08 Europe/Rome",
 ];
 
+/// Every literal of [`TIMES`] as `time` and `timetz` under each `DateStyle` order, in a session
+/// zone with daylight saving, read at the transaction's start PostgreSQL reports beside it.
 #[test]
-fn pg18_reads_every_time_literal() {
+fn pg18_reads_every_time_literal_under_each_order() {
     let mut conn = pg18_conn();
-    let mut cases = Vec::new();
-    for &text in TIMES {
-        cases.push((
-            format!("{}::time", quoted(text)),
-            worded(PgTime::parse(text, InputContext::new())),
-        ));
-        let timetz = PgTimeTz::parse(text, InputContext::new());
-        if timetz != Err(DateTimeError::Unsupported) {
-            cases.push((format!("{}::timetz", quoted(text)), worded(timetz)));
+    let zone_name = "Europe/Rome";
+    let zone = PgTimeZone::parse(zone_name).expect("zone");
+    set_timezone(&mut conn, zone_name);
+    let fallback = PgTimestampTz::parse("2026-01-15 12:00+00", InputContext::new()).expect("start");
+    let mut mismatches = Vec::new();
+    for (style, order) in [
+        ("MDY", DateOrder::Mdy),
+        ("DMY", DateOrder::Dmy),
+        ("YMD", DateOrder::Ymd),
+    ] {
+        // Raw SQL: `SET DateStyle` is a session command with no DSL form.
+        diesel::sql_query(format!("SET DateStyle = 'ISO, {style}'"))
+            .execute(&mut conn)
+            .expect("set DateStyle");
+        for &text in TIMES {
+            for pg_type in ["time", "timetz"] {
+                let expression = format!("{}::{pg_type}", quoted(text));
+                let (expected, now) = pg18_answer_at_now(&mut conn, &expression);
+                let start = now.map_or(fallback, |now| {
+                    PgTimestampTz::parse(&format!("{now}+00"), InputContext::new()).expect("now")
+                });
+                let context = InputContext::new()
+                    .with_time_zone(&zone)
+                    .with_date_order(order)
+                    .with_now(start);
+                let got = if pg_type == "time" {
+                    worded(PgTime::parse(text, context))
+                } else {
+                    worded(PgTimeTz::parse(text, context))
+                };
+                if got != expected {
+                    mismatches.push(format!(
+                        "{style} {expression}: crate {got:?}, PostgreSQL {expected:?}"
+                    ));
+                }
+            }
         }
     }
-    assert_answers(&mut conn, cases);
+    diesel::sql_query("SET DateStyle = 'ISO, MDY'")
+        .execute(&mut conn)
+        .expect("reset DateStyle");
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    // Without an order, a literal reads only if every order reads it alike.
+    let context = InputContext::new().with_time_zone(&zone).with_now(fallback);
+    assert_eq!(
+        PgTimeTz::parse("01/02/03 12:00", context)
+            .map(|t| t.to_string())
+            .as_deref(),
+        Ok("12:00:00+01")
+    );
+    assert_eq!(
+        PgTimeTz::parse("07/01/03 12:00", context),
+        Err(DateTimeError::NeedsDateOrder)
+    );
+    // PostgreSQL places a date past jiff's years, which the crate cannot.
+    assert_eq!(
+        PgTimeTz::parse("20000-01-01 12:00 Europe/Rome", context),
+        Err(DateTimeError::OutsideJiffRange)
+    );
 }
 
 /// `timetz_cmp` on every pair of the time literals that read as `timetz`.
@@ -433,6 +626,372 @@ fn pg18_reads_every_time_zone_setting() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+/// Date and timestamp literals of every spelling `DecodeDateTime` reads, its refusals, and the
+/// spellings whose reading `DateStyle`'s order decides.
+const DATE_TIME_LITERALS: &[&str] = &[
+    "1999-01-08",
+    "January 8, 1999",
+    "1/8/1999",
+    "1/18/1999",
+    "01/02/03",
+    "1999-Jan-08",
+    "Jan-08-1999",
+    "08-Jan-1999",
+    "99-Jan-08",
+    "08-Jan-99",
+    "Jan-08-99",
+    "19990108",
+    "990108",
+    "1999.008",
+    "1999.366",
+    "1999.367",
+    "2000.366",
+    "J2451187",
+    "J 2451187",
+    "J2451187.75",
+    "julian 2451187",
+    "January 8, 99 BC",
+    "jan 8 1999 bc",
+    "8 jan 1999",
+    "1999 jan 8",
+    "1999 8 jan",
+    "Sat Jan 08 1999",
+    "Friday January 8 1999",
+    "1999-01-08 Fri",
+    "2024-02-29",
+    "2023-02-29",
+    "0099-01-08",
+    "99-01-08",
+    "69-01-01",
+    "70-01-01",
+    "1999 01 08",
+    "1999/01/08",
+    "1999.01.08",
+    "08.01.1999",
+    "01.08.1999",
+    "1999-1-8",
+    "1-8-1999",
+    "8-1-1999",
+    "12/31/99",
+    "31/12/99",
+    "99/12/31",
+    "13/01/99",
+    "2/29/2000",
+    "29/2/2000",
+    "1999-13-08",
+    "1999-01-32",
+    "1999-01-08T040506",
+    "1999-01-08 040506",
+    "19990108 040506",
+    "19990108T040506.5",
+    "1999-01-08 04:05",
+    "1999-01-08 04:05:06.789",
+    "1999-01-08 4:5:6",
+    "1999-01-08 04:05.5",
+    "1999-01-08 04:05:06.",
+    "1999-01-08 04:05:06.1234567",
+    "1999-01-08 04:05 AM",
+    "1999-01-08 12:05 AM",
+    "1999-01-08 12:05 PM",
+    "1999-01-08 13:05 PM",
+    "1999-01-08 04:05:06 PM",
+    "Jan 8, 1999 04:05 PM PST",
+    "1999-01-08 25:00",
+    "1999-01-08 12:60",
+    "1999-01-08 04:05:06 -8:00",
+    "1999-01-08 04:05:06-08",
+    "1999-01-08 04:05:06.5 +05:30",
+    "1999-01-08 040506-08",
+    "1999-01-08 04:05:06 PST",
+    "1999-01-08 04:05:06 zulu",
+    "1999-01-08 04:05:06 CET DST",
+    "1999-01-08 04:05:06 DST CET",
+    "1999-01-08 04:05:06 DST",
+    "1999-01-08 04:05:06 MSK DST",
+    "1999-01-08 04:05:06 America/New_York",
+    "2003-04-12 04:05:06 America/New_York",
+    "1999-01-08 04:05:06 Europe/Rome DST",
+    "1999-01-08 04:05:06 Mars/Olympus",
+    "1999-01-08 04:05:06 bogus",
+    "04:05:06 1999-01-08",
+    "04:05:06",
+    "1999-01-08 t 04:05:06",
+    "1999-01-08t04:05:06",
+    "1999-01-08 j",
+    "t",
+    "1999-01-08 dow",
+    "1999-01-08 04:05:06 +05 BC",
+    "1999-01-08 04:05:06 PST BC",
+    "allballs",
+    "1999-01-08 allballs",
+    "epoch",
+    "infinity",
+    "-infinity",
+    "4714-11-24 BC",
+    "4714-11-23 BC",
+    "5874897-12-31",
+    "5874898-01-01",
+    "294276-12-31 23:59:59.999999",
+    "123456789-01-01",
+    "2147483648-01-01",
+    "1999-01-08 04:05:06 at",
+    "@ 1999-01-08",
+    "1999-01-08 ago",
+    "",
+    "   ",
+    "1999-01-08 04:05:06 +",
+    "1999-01-08 04:05:06 -abc",
+    "1999-01-08 04:05:06 +05:30:15:00",
+    "1999-01-08 04:05:06 +1:2:3",
+    "1999-01-08 04:05:06 +16",
+    "1999-01-08 04:05:06 + 05",
+    "1999-01-08 04:05:06 +05x",
+    "Jan 8 1999 Jan",
+    "1999-01-08 1999-01-09",
+    "1999-01-08 04:05 04:06",
+    "1999-01-08 04:05:06 -08 -09",
+    "1999-01-08 040506.789",
+    "1999 01 08 04 05 06",
+    "990108040506",
+    "1999010804",
+    "19990108040506",
+    "1999.0108",
+    "1999-01-08 2451187",
+    "1999-01-08 isodow",
+    "1999-01-08 h",
+    "1999-01-08 04:05:06.5e3",
+    "0001-01-01 BC",
+    "0000-01-01",
+    "1999-01-08 bc ad",
+    "J2451187-08",
+    "J2451187-16",
+    "J99999999999-08",
+    "J2451187/08",
+    "J2451187-",
+    "1999-01-08 04:05 +05:99999999999",
+    "1999-01-08 04:05 +05:30:99999999999",
+    "1999-01-08 04:05 +05:30:15",
+    "1999-01-08 04:05 +0530",
+    "1999-01-08 99999999999999999999:00",
+    "1999-01-08 04:99999999999",
+    "1999-01-08 04:05:99999999999",
+    "1999-01-08 04:05:06:07",
+    "1999-01-08 04:60",
+    "1999-01-08 04:05:61",
+    "1999-01-08 04:05:60",
+    "1999-01-08 24:00:00.000001",
+    "1999-01-08 04:05.9999999",
+    "1999-01-08 t abc-08",
+    "1999-01-08 t 0405-08",
+    "1999-01-08 h 0405-08",
+    "1999-01-08 04:05 t 0405-08",
+    "Jan 08 0405-08",
+    "Jan 08 040506-08",
+    "Jan 08 04:05 0405-08",
+    "Jan 08 1999 0405-08",
+    "1999-01-08 t0405",
+    "1999-01-08 t 04",
+    "1999-01-08 t 040506.5",
+    "1999-01-08 t 12.5",
+    "1999-01-08 04:05 t 0607",
+    "1999-01-08 12.5",
+    "Jan 1999 0008",
+    "99-Jan-008",
+    "1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1-1",
+    "1999-01--08",
+    "1999-01-08-09",
+    "Jan-at-08-1999",
+    "1999-at-01-08",
+    "1999-on-01-08",
+    "Jan-Feb-08-1999",
+    "1999-01-08 h5",
+    "1999-01-08 h 04:05",
+    "1999-01-08 j 99999999999",
+    "1999-01-08 04:05 040506",
+    "1999-01-08 Jan",
+    "1999 99 Jan",
+    "1999 08 Jan",
+    "1 1999 Jan",
+    "j j 2451187",
+    "1999-01-08 j t",
+    "08 Jan-1999",
+    "1999 Jan-08-2000",
+    "04:05:06 1999-01-08-040506",
+    "Jan 08 abc/def",
+    "Jan 08 Europe/Rome",
+    "Jan 08 Mars/Olympus",
+    "1999-01-08 04:05:06.5 Europe/Rome",
+    "1999-01-08 04:05:06.5.5",
+    "1999-01-08 04:05.5:06",
+    "J2451187.5.5",
+    "47714714-114",
+    "2147483647-366",
+    "1000000-001",
+];
+
+/// Every literal of [`DATE_TIME_LITERALS`] under each `DateStyle` order, as `date`,
+/// `timestamp` and `timestamptz`, the last printed at UTC.
+#[test]
+fn pg18_reads_every_date_time_literal_under_each_order() {
+    let mut conn = pg18_conn();
+    let utc = PgTimeZone::parse("UTC").expect("UTC");
+    for (style, order) in [
+        ("MDY", DateOrder::Mdy),
+        ("DMY", DateOrder::Dmy),
+        ("YMD", DateOrder::Ymd),
+    ] {
+        // Raw SQL: `SET DateStyle` is a session command with no DSL form.
+        diesel::sql_query(format!("SET DateStyle = 'ISO, {style}'"))
+            .execute(&mut conn)
+            .expect("set DateStyle");
+        let context = InputContext::new()
+            .with_time_zone(&utc)
+            .with_date_order(order);
+        let mut cases = Vec::new();
+        for &text in DATE_TIME_LITERALS {
+            let literal = quoted(text);
+            cases.push((
+                format!("{literal}::date"),
+                worded(PgDate::parse(text, context)),
+            ));
+            cases.push((
+                format!("{literal}::timestamp"),
+                worded(PgTimestamp::parse(text, context)),
+            ));
+            cases.push((
+                format!("({literal}::timestamptz AT TIME ZONE 'UTC')"),
+                worded(PgTimestampTz::parse(text, context).and_then(|at| at.to_timestamp(&utc))),
+            ));
+        }
+        assert_answers(&mut conn, cases);
+    }
+    diesel::sql_query("SET DateStyle = 'ISO, MDY'")
+        .execute(&mut conn)
+        .expect("reset DateStyle");
+}
+
+/// Without an order the crate reads a literal only when every order reads it alike, and
+/// refuses it otherwise.
+#[test]
+fn pg18_refuses_only_the_literals_the_order_decides() {
+    let mut conn = pg18_conn();
+    let mut answers: Vec<Vec<Result<String, String>>> = Vec::new();
+    for style in ["MDY", "DMY", "YMD"] {
+        diesel::sql_query(format!("SET DateStyle = 'ISO, {style}'"))
+            .execute(&mut conn)
+            .expect("set DateStyle");
+        answers.push(
+            DATE_TIME_LITERALS
+                .iter()
+                .map(|&text| pg18_answer(&mut conn, &format!("{}::timestamp", quoted(text))))
+                .collect(),
+        );
+    }
+    diesel::sql_query("SET DateStyle = 'ISO, MDY'")
+        .execute(&mut conn)
+        .expect("reset DateStyle");
+    let mut mismatches = Vec::new();
+    for (index, &text) in DATE_TIME_LITERALS.iter().enumerate() {
+        let alike =
+            answers[0][index] == answers[1][index] && answers[1][index] == answers[2][index];
+        let got = worded(PgTimestamp::parse(text, InputContext::new()));
+        let expected = if alike {
+            answers[0][index].clone()
+        } else {
+            Err(DateTimeError::NeedsDateOrder.to_string())
+        };
+        if got != expected {
+            mismatches.push(format!("{text:?}: crate {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    // One ambiguous date under each order.
+    let read = |order| {
+        PgDate::parse("01/02/03", InputContext::new().with_date_order(order)).map(|d| d.to_string())
+    };
+    assert_eq!(read(DateOrder::Mdy).as_deref(), Ok("2003-01-02"));
+    assert_eq!(read(DateOrder::Dmy).as_deref(), Ok("2003-02-01"));
+    assert_eq!(read(DateOrder::Ymd).as_deref(), Ok("2001-02-03"));
+}
+
+/// `now`, `today`, `tomorrow` and `yesterday`, read in one statement with the transaction's
+/// start, in a zone where the local date differs from UTC's.
+#[test]
+fn pg18_reads_the_current_time_words() {
+    let mut conn = pg18_conn();
+    let zone_name = "Pacific/Kiritimati";
+    let zone = PgTimeZone::parse(zone_name).expect("zone");
+    set_timezone(&mut conn, zone_name);
+    let mut mismatches = Vec::new();
+    for text in [
+        "now",
+        "today",
+        "tomorrow",
+        "yesterday",
+        "today 12:00",
+        "tomorrow allballs",
+        "now +05",
+        "today epoch",
+    ] {
+        for (cast, utc) in [("date", false), ("timestamp", false), ("timestamptz", true)] {
+            let value = if utc {
+                format!("({}::timestamptz AT TIME ZONE 'UTC')", quoted(text))
+            } else {
+                format!("{}::{cast}", quoted(text))
+            };
+            let (expected, now) = pg18_answer_at_now(&mut conn, &value);
+            let fallback = PgTimestampTz::parse("2026-01-01 00:00+00", InputContext::new());
+            let start = now.map_or(fallback, |now| {
+                PgTimestampTz::parse(&format!("{now}+00"), InputContext::new())
+            });
+            let context = InputContext::new()
+                .with_time_zone(&zone)
+                .with_now(start.expect("a start"));
+            let utc_zone = PgTimeZone::parse("UTC").expect("UTC");
+            let got = match cast {
+                "date" => worded(PgDate::parse(text, context)),
+                "timestamp" => worded(PgTimestamp::parse(text, context)),
+                _ => worded(
+                    PgTimestampTz::parse(text, context).and_then(|at| at.to_timestamp(&utc_zone)),
+                ),
+            };
+            if got != expected {
+                mismatches.push(format!(
+                    "{text} as {cast}: crate {got:?}, PostgreSQL {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    // The words need the current time, and the zone that dates it.
+    assert_eq!(
+        PgDate::parse("today", InputContext::new().with_time_zone(&zone)),
+        Err(DateTimeError::NeedsCurrentTime)
+    );
+    let start = PgTimestampTz::parse("2026-01-01 00:00+00", InputContext::new()).expect("start");
+    assert_eq!(
+        PgDate::parse("today", InputContext::new().with_now(start)),
+        Err(DateTimeError::NeedsTimeZone)
+    );
+    // A transaction's start is finite, and `timestamp2tm` refuses an infinity in any zone.
+    let fixed = PgTimeZone::parse("+14").expect("a fixed zone");
+    for (now, zone) in [
+        (PgTimestampTz::INFINITY, &zone),
+        (PgTimestampTz::INFINITY, &fixed),
+        (PgTimestampTz::NEG_INFINITY, &fixed),
+    ] {
+        let context = InputContext::new().with_time_zone(zone).with_now(now);
+        assert_eq!(
+            PgDate::parse("today", context),
+            Err(DateTimeError::TimestampOutOfRange)
+        );
+        assert_eq!(
+            PgTimestamp::parse("now", context),
+            Err(DateTimeError::TimestampOutOfRange)
+        );
+    }
+}
+
 /// Clocks at which the sets' abbreviations are read, on either side of Moscow's changes of 2011
 /// and 2014.
 const ABBREVIATION_CLOCKS: &[&str] = &["2010-07-15 12:00", "2012-01-15 12:00", "2026-01-15 12:00"];
@@ -513,14 +1072,13 @@ fn pg18_reads_abbreviations_of_the_session_zone() {
         })
         .collect();
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
-    // An abbreviation nobody knows is refused, and the crate declines rather than guesses.
+    // An abbreviation neither the set nor the session's zone knows is a syntax error.
     let context = InputContext::new().with_time_zone(&utc);
-    assert_eq!(
-        PgTimestampTz::parse("1880-01-01 12:00 RMT", context),
-        Err(DateTimeError::Unsupported)
-    );
     set_timezone(&mut conn, "UTC");
-    assert!(pg18_answer(&mut conn, "'1880-01-01 12:00 RMT'::timestamptz").is_err());
+    assert_eq!(
+        worded(PgTimestampTz::parse("1880-01-01 12:00 RMT", context)),
+        pg18_answer(&mut conn, "'1880-01-01 12:00 RMT'::timestamptz")
+    );
 }
 
 // Raw SQL: vendor cast syntax cannot be expressed in the Diesel DSL.
