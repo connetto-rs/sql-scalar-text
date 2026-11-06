@@ -5,6 +5,14 @@
 //! `'1.999999999 millisecond'` differently.
 
 use super::{IntervalError, PgInterval};
+use crate::datetime::tokens::{
+    AGO, BadFormat, CENTURY, DATE_TOKENS, DAY, DECADE, DTK_ALL_SECS_M, DTK_CENTURY, DTK_DATE_M,
+    DTK_DAY, DTK_DECADE, DTK_DELTA, DTK_EARLY, DTK_HOUR, DTK_LATE, DTK_MICROSEC, DTK_MILLENNIUM,
+    DTK_MILLISEC, DTK_MINUTE, DTK_MONTH, DTK_QUARTER, DTK_SECOND, DTK_TIME_M, DTK_TZ, DTK_TZ_HOUR,
+    DTK_TZ_MINUTE, DTK_WEEK, DTK_YEAR, FieldType, HOUR, IGNORE_DTF, MICROSECOND, MILLENNIUM,
+    MILLISECOND, MINUTE, MONTH, RESERV, SECOND, Tokens, UNITS, UNKNOWN_FIELD, WEEK, YEAR, dtk_m,
+    lookup, parse_date_time, parse_fraction, parse_fractional_second, strtoint, strtoll,
+};
 use crate::float::{
     fits_in_i32, fits_in_i64, int_to_f64, round_ties_even, truncate_to_i32, truncate_to_i64,
 };
@@ -18,79 +26,6 @@ const USECS_PER_HOUR: i64 = 3_600_000_000;
 const USECS_PER_MINUTE: i64 = 60_000_000;
 const USECS_PER_SEC: i64 = 1_000_000;
 
-/// `MAXDATEFIELDS`, the most tokens `ParseDateTime` splits a literal into.
-const MAX_DATE_FIELDS: usize = 25;
-/// The size of `interval_in`'s `workbuf`, which bounds the tokens' bytes.
-const WORKBUF_LEN: usize = 256;
-/// `TOKMAXLEN`, the prefix a keyword lookup compares.
-const TOKEN_MAX_LEN: usize = 10;
-
-// Token types, as `datetime.h` numbers them. A field type doubles as a bit
-// position in the masks that catch a field written twice.
-const RESERV: i32 = 0;
-const MONTH: i32 = 1;
-const YEAR: i32 = 2;
-const DAY: i32 = 3;
-const IGNORE_DTF: i32 = 8;
-const AMPM: i32 = 9;
-const HOUR: i32 = 10;
-const MINUTE: i32 = 11;
-const SECOND: i32 = 12;
-const MILLISECOND: i32 = 13;
-const MICROSECOND: i32 = 14;
-const DOW: i32 = 16;
-const UNITS: i32 = 17;
-const ADBC: i32 = 18;
-const AGO: i32 = 19;
-const ISOTIME: i32 = 23;
-const WEEK: i32 = 24;
-const DECADE: i32 = 25;
-const CENTURY: i32 = 26;
-const MILLENNIUM: i32 = 27;
-const DTZMOD: i32 = 28;
-const UNKNOWN_FIELD: i32 = 31;
-
-// Unit and keyword codes, as `datetime.h` numbers them.
-const DTK_TIME: i32 = 3;
-const DTK_TZ: i32 = 4;
-const DTK_EARLY: i32 = 9;
-const DTK_LATE: i32 = 10;
-const DTK_EPOCH: i32 = 11;
-const DTK_NOW: i32 = 12;
-const DTK_YESTERDAY: i32 = 13;
-const DTK_TODAY: i32 = 14;
-const DTK_TOMORROW: i32 = 15;
-const DTK_ZULU: i32 = 16;
-const DTK_DELTA: i32 = 17;
-const DTK_SECOND: i32 = 18;
-const DTK_MINUTE: i32 = 19;
-const DTK_HOUR: i32 = 20;
-const DTK_DAY: i32 = 21;
-const DTK_WEEK: i32 = 22;
-const DTK_MONTH: i32 = 23;
-const DTK_QUARTER: i32 = 24;
-const DTK_YEAR: i32 = 25;
-const DTK_DECADE: i32 = 26;
-const DTK_CENTURY: i32 = 27;
-const DTK_MILLENNIUM: i32 = 28;
-const DTK_MILLISEC: i32 = 29;
-const DTK_MICROSEC: i32 = 30;
-const DTK_JULIAN: i32 = 31;
-const DTK_DOW: i32 = 32;
-const DTK_DOY: i32 = 33;
-const DTK_TZ_HOUR: i32 = 34;
-const DTK_TZ_MINUTE: i32 = 35;
-const DTK_ISOYEAR: i32 = 36;
-const DTK_ISODOW: i32 = 37;
-
-const fn dtk_m(field: i32) -> u32 {
-    1 << field
-}
-
-const DTK_ALL_SECS_M: u32 = dtk_m(SECOND) | dtk_m(MILLISECOND) | dtk_m(MICROSECOND);
-const DTK_DATE_M: u32 = dtk_m(YEAR) | dtk_m(MONTH) | dtk_m(DAY);
-const DTK_TIME_M: u32 = dtk_m(HOUR) | dtk_m(MINUTE) | DTK_ALL_SECS_M;
-
 /// `INTERVAL_FULL_RANGE`, the range of an unrestricted interval.
 pub(super) const INTERVAL_FULL_RANGE: u16 = 0x7FFF;
 // `INTERVAL_MASK`, the bit a typmod sets for each field it keeps.
@@ -100,6 +35,15 @@ pub(super) const RANGE_DAY: u16 = 1 << DAY;
 pub(super) const RANGE_HOUR: u16 = 1 << HOUR;
 pub(super) const RANGE_MINUTE: u16 = 1 << MINUTE;
 pub(super) const RANGE_SECOND: u16 = 1 << SECOND;
+
+/// The size of `interval_in`'s `workbuf`, which bounds the tokens' bytes.
+const WORKBUF_LEN: usize = 256;
+
+impl From<BadFormat> for IntervalError {
+    fn from(_: BadFormat) -> Self {
+        Self::InvalidSyntax
+    }
+}
 
 /// `deltatktbl`, the unit words.
 const DELTA_TOKENS: &[(&str, i32, i32)] = &[
@@ -166,82 +110,6 @@ const DELTA_TOKENS: &[(&str, i32, i32)] = &[
     ("yrs", UNITS, DTK_YEAR),
 ];
 
-/// `datetktbl`, the date keywords, consulted for a word that names no unit.
-const DATE_TOKENS: &[(&str, i32, i32)] = &[
-    ("+infinity", RESERV, DTK_LATE),
-    ("-infinity", RESERV, DTK_EARLY),
-    ("ad", ADBC, 0),
-    ("allballs", RESERV, DTK_ZULU),
-    ("am", AMPM, 0),
-    ("apr", MONTH, 4),
-    ("april", MONTH, 4),
-    ("at", IGNORE_DTF, 0),
-    ("aug", MONTH, 8),
-    ("august", MONTH, 8),
-    ("bc", ADBC, 1),
-    ("d", UNITS, DTK_DAY),
-    ("dec", MONTH, 12),
-    ("december", MONTH, 12),
-    ("dow", UNITS, DTK_DOW),
-    ("doy", UNITS, DTK_DOY),
-    ("dst", DTZMOD, 3_600),
-    ("epoch", RESERV, DTK_EPOCH),
-    ("feb", MONTH, 2),
-    ("february", MONTH, 2),
-    ("fri", DOW, 5),
-    ("friday", DOW, 5),
-    ("h", UNITS, DTK_HOUR),
-    ("infinity", RESERV, DTK_LATE),
-    ("isodow", UNITS, DTK_ISODOW),
-    ("isoyear", UNITS, DTK_ISOYEAR),
-    ("j", UNITS, DTK_JULIAN),
-    ("jan", MONTH, 1),
-    ("january", MONTH, 1),
-    ("jd", UNITS, DTK_JULIAN),
-    ("jul", MONTH, 7),
-    ("julian", UNITS, DTK_JULIAN),
-    ("july", MONTH, 7),
-    ("jun", MONTH, 6),
-    ("june", MONTH, 6),
-    ("m", UNITS, DTK_MONTH),
-    ("mar", MONTH, 3),
-    ("march", MONTH, 3),
-    ("may", MONTH, 5),
-    ("mm", UNITS, DTK_MINUTE),
-    ("mon", DOW, 1),
-    ("monday", DOW, 1),
-    ("nov", MONTH, 11),
-    ("november", MONTH, 11),
-    ("now", RESERV, DTK_NOW),
-    ("oct", MONTH, 10),
-    ("october", MONTH, 10),
-    ("on", IGNORE_DTF, 0),
-    ("pm", AMPM, 1),
-    ("s", UNITS, DTK_SECOND),
-    ("sat", DOW, 6),
-    ("saturday", DOW, 6),
-    ("sep", MONTH, 9),
-    ("sept", MONTH, 9),
-    ("september", MONTH, 9),
-    ("sun", DOW, 0),
-    ("sunday", DOW, 0),
-    ("t", ISOTIME, DTK_TIME),
-    ("thu", DOW, 4),
-    ("thur", DOW, 4),
-    ("thurs", DOW, 4),
-    ("thursday", DOW, 4),
-    ("today", RESERV, DTK_TODAY),
-    ("tomorrow", RESERV, DTK_TOMORROW),
-    ("tue", DOW, 2),
-    ("tues", DOW, 2),
-    ("tuesday", DOW, 2),
-    ("wed", DOW, 3),
-    ("wednesday", DOW, 3),
-    ("weds", DOW, 3),
-    ("y", UNITS, DTK_YEAR),
-    ("yesterday", RESERV, DTK_YESTERDAY),
-];
-
 /// Reads `text` as PostgreSQL reads an interval literal whose typmod keeps the fields in `range`
 /// and rounds seconds to `precision` digits.
 ///
@@ -252,11 +120,13 @@ pub(super) fn interval_in(
     range: u16,
     precision: Option<u8>,
 ) -> Result<PgInterval, IntervalError> {
-    let decoded =
-        match parse_date_time(text.as_bytes()).and_then(|tokens| decode_interval(&tokens, range)) {
-            Err(IntervalError::InvalidSyntax) => decode_iso8601_interval(text.as_bytes()),
-            other => other,
-        };
+    let decoded = match parse_date_time(text.as_bytes(), WORKBUF_LEN)
+        .map_err(IntervalError::from)
+        .and_then(|tokens| decode_interval(&tokens, range))
+    {
+        Err(IntervalError::InvalidSyntax) => decode_iso8601_interval(text.as_bytes()),
+        other => other,
+    };
     let mut result = match decoded? {
         (DTK_LATE, _) => return Ok(PgInterval::INFINITY),
         (DTK_EARLY, _) => return Ok(PgInterval::NEG_INFINITY),
@@ -275,313 +145,11 @@ struct ItmIn {
     year: i32,
 }
 
-/// The field types `ParseDateTime` assigns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldType {
-    /// `DTK_NUMBER`, digits with at most a decimal point.
-    Number,
-    /// `DTK_STRING`, a word.
-    String,
-    /// `DTK_DATE`, digits with delimiters or a word run into digits.
-    Date,
-    /// `DTK_TIME`, digits with colons.
-    Time,
-    /// `DTK_TZ`, a sign followed by digits.
-    Tz,
-    /// `DTK_SPECIAL`, a sign followed by a word.
-    Special,
-}
-
-/// A `ParseDateTime` token, located in the work buffer.
-#[derive(Debug, Clone, Copy)]
-struct Field {
-    start: usize,
-    end: usize,
-    kind: FieldType,
-}
-
-/// `interval_in`'s `workbuf` and the tokens `ParseDateTime` wrote into it.
-struct Tokens {
-    bytes: [u8; WORKBUF_LEN],
-    used: usize,
-    fields: [Field; MAX_DATE_FIELDS],
-    count: usize,
-}
-
-impl Tokens {
-    /// Appends one byte to the token being written, refusing a literal whose
-    /// tokens overrun the work buffer.
-    fn push(&mut self, byte: u8) -> Result<(), IntervalError> {
-        if self.used + 1 >= WORKBUF_LEN {
-            return Err(IntervalError::InvalidSyntax);
-        }
-        self.bytes[self.used] = byte;
-        self.used += 1;
-        Ok(())
-    }
-
-    /// Closes the token that started at `start`, which takes its terminating
-    /// NUL in the work buffer.
-    fn finish(&mut self, start: usize, kind: FieldType) {
-        self.fields[self.count] = Field {
-            start,
-            end: self.used,
-            kind,
-        };
-        self.count += 1;
-        self.used += 1;
-    }
-
-    fn field(&self, index: usize) -> (&[u8], FieldType) {
-        let field = self.fields[index];
-        (&self.bytes[field.start..field.end], field.kind)
-    }
-}
-
-/// `ParseDateTime`, which splits a literal into typed tokens.
-fn parse_date_time(input: &[u8]) -> Result<Tokens, IntervalError> {
-    let mut tokens = Tokens {
-        bytes: [0; WORKBUF_LEN],
-        used: 0,
-        fields: [Field {
-            start: 0,
-            end: 0,
-            kind: FieldType::Number,
-        }; MAX_DATE_FIELDS],
-        count: 0,
-    };
-    let mut at = 0_usize;
-    let byte = |index: usize| input.get(index).copied().unwrap_or(0);
-
-    while at < input.len() {
-        if is_space(byte(at)) {
-            at += 1;
-            continue;
-        }
-        if tokens.count >= MAX_DATE_FIELDS {
-            return Err(IntervalError::InvalidSyntax);
-        }
-        let start = tokens.used;
-        let kind;
-        let current = byte(at);
-        if current.is_ascii_digit() {
-            tokens.push(current)?;
-            at += 1;
-            while byte(at).is_ascii_digit() {
-                tokens.push(byte(at))?;
-                at += 1;
-            }
-            if byte(at) == b':' {
-                kind = FieldType::Time;
-                tokens.push(b':')?;
-                at += 1;
-                while byte(at).is_ascii_digit() || byte(at) == b':' || byte(at) == b'.' {
-                    tokens.push(byte(at))?;
-                    at += 1;
-                }
-            } else if matches!(byte(at), b'-' | b'/' | b'.') {
-                let delimiter = byte(at);
-                tokens.push(delimiter)?;
-                at += 1;
-                if byte(at).is_ascii_digit() {
-                    let mut date_kind = if delimiter == b'.' {
-                        FieldType::Number
-                    } else {
-                        FieldType::Date
-                    };
-                    while byte(at).is_ascii_digit() {
-                        tokens.push(byte(at))?;
-                        at += 1;
-                    }
-                    if byte(at) == delimiter {
-                        date_kind = FieldType::Date;
-                        tokens.push(delimiter)?;
-                        at += 1;
-                        while byte(at).is_ascii_digit() || byte(at) == delimiter {
-                            tokens.push(byte(at))?;
-                            at += 1;
-                        }
-                    }
-                    kind = date_kind;
-                } else {
-                    kind = FieldType::Date;
-                    while byte(at).is_ascii_alphanumeric() || byte(at) == delimiter {
-                        tokens.push(byte(at).to_ascii_lowercase())?;
-                        at += 1;
-                    }
-                }
-            } else {
-                kind = FieldType::Number;
-            }
-        } else if current == b'.' {
-            tokens.push(b'.')?;
-            at += 1;
-            while byte(at).is_ascii_digit() {
-                tokens.push(byte(at))?;
-                at += 1;
-            }
-            kind = FieldType::Number;
-        } else if current.is_ascii_alphabetic() {
-            tokens.push(current.to_ascii_lowercase())?;
-            at += 1;
-            while byte(at).is_ascii_alphabetic() {
-                tokens.push(byte(at).to_ascii_lowercase())?;
-                at += 1;
-            }
-            // A word followed by a digit or a sign is a date or a zone name
-            // unless it is one of the date keywords.
-            let is_date = matches!(byte(at), b'-' | b'/' | b'.')
-                || ((byte(at) == b'+' || byte(at).is_ascii_digit())
-                    && lookup(DATE_TOKENS, &tokens.bytes[start..tokens.used]).is_none());
-            if is_date {
-                loop {
-                    tokens.push(byte(at).to_ascii_lowercase())?;
-                    at += 1;
-                    let next = byte(at);
-                    if !(matches!(next, b'+' | b'-' | b'/' | b'_' | b'.' | b':')
-                        || next.is_ascii_alphanumeric())
-                    {
-                        break;
-                    }
-                }
-                kind = FieldType::Date;
-            } else {
-                kind = FieldType::String;
-            }
-        } else if current == b'+' || current == b'-' {
-            tokens.push(current)?;
-            at += 1;
-            while is_space(byte(at)) {
-                at += 1;
-            }
-            if byte(at).is_ascii_digit() {
-                tokens.push(byte(at))?;
-                at += 1;
-                while byte(at).is_ascii_digit() || matches!(byte(at), b':' | b'.' | b'-') {
-                    tokens.push(byte(at))?;
-                    at += 1;
-                }
-                kind = FieldType::Tz;
-            } else if byte(at).is_ascii_alphabetic() {
-                tokens.push(byte(at).to_ascii_lowercase())?;
-                at += 1;
-                while byte(at).is_ascii_alphabetic() {
-                    tokens.push(byte(at).to_ascii_lowercase())?;
-                    at += 1;
-                }
-                kind = FieldType::Special;
-            } else {
-                return Err(IntervalError::InvalidSyntax);
-            }
-        } else if current.is_ascii_punctuation() {
-            at += 1;
-            continue;
-        } else {
-            return Err(IntervalError::InvalidSyntax);
-        }
-        tokens.finish(start, kind);
-    }
-    Ok(tokens)
-}
-
-/// `isspace` in the C locale.
-fn is_space(character: u8) -> bool {
-    matches!(character, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
-}
-
-/// `datebsearch`, matching `key` against each token's first `TOKMAXLEN` bytes.
-fn lookup(table: &[(&str, i32, i32)], key: &[u8]) -> Option<(i32, i32)> {
-    let key = &key[..key.len().min(TOKEN_MAX_LEN)];
-    table.iter().find_map(|&(token, kind, value)| {
-        let token = token.as_bytes();
-        (&token[..token.len().min(TOKEN_MAX_LEN)] == key).then_some((kind, value))
-    })
-}
-
-/// `DecodeSpecial` for a date or time literal's word: `None` for one `datetktbl` lacks,
-/// `Some(Some(bc))` for `ad` or `bc`, and `Some(None)` for any of its other words.
-pub(crate) fn date_word_era(word: &[u8]) -> Option<Option<bool>> {
-    lookup(DATE_TOKENS, word).map(|(kind, value)| (kind == ADBC).then_some(value == 1))
-}
-
 /// `DecodeUnits` falling back to `DecodeSpecial`, answering the token type and value.
 fn decode_word(word: &[u8]) -> (i32, i32) {
     lookup(DELTA_TOKENS, word)
         .or_else(|| lookup(DATE_TOKENS, word))
         .unwrap_or((UNKNOWN_FIELD, 0))
-}
-
-/// `strtol` over a token, answering the value, where the digits end, and whether C reports
-/// `ERANGE`.
-fn strtoll(text: &[u8], start: usize) -> (i64, usize, bool) {
-    let mut at = start;
-    let negative = match text.get(at) {
-        Some(b'-') => {
-            at += 1;
-            true
-        }
-        Some(b'+') => {
-            at += 1;
-            false
-        }
-        _ => false,
-    };
-    let digits_start = at;
-    let mut value: i64 = 0;
-    let mut overflowed = false;
-    while let Some(digit) = text.get(at).filter(|byte| byte.is_ascii_digit()) {
-        let digit = i64::from(digit - b'0');
-        let next = value.checked_mul(10).and_then(|scaled| {
-            if negative {
-                scaled.checked_sub(digit)
-            } else {
-                scaled.checked_add(digit)
-            }
-        });
-        if let Some(next) = next {
-            value = next;
-        } else {
-            overflowed = true;
-            value = if negative { i64::MIN } else { i64::MAX };
-        }
-        at += 1;
-    }
-    if at == digits_start {
-        return (0, start, false);
-    }
-    (value, at, overflowed)
-}
-
-/// `strtoint`, which is `strtol` narrowed to `int` with `ERANGE` when it does not fit.
-fn strtoint(text: &[u8], start: usize) -> (i32, usize, bool) {
-    let (value, end, overflowed) = strtoll(text, start);
-    match i32::try_from(value) {
-        Ok(narrow) => (narrow, end, overflowed),
-        // PostgreSQL returns the truncated value alongside `ERANGE`, and every
-        // caller fails on the `ERANGE` before reading it.
-        Err(_) => (0, end, true),
-    }
-}
-
-/// `ParseFraction`, the value of the `.digits` ending a token.
-fn parse_fraction(text: &[u8]) -> Result<f64, IntervalError> {
-    debug_assert_eq!(text.first(), Some(&b'.'), "a fraction starts at its point");
-    if text.len() == 1 {
-        return Ok(0.0);
-    }
-    if !text[1..].iter().all(u8::is_ascii_digit) {
-        return Err(IntervalError::InvalidSyntax);
-    }
-    core::str::from_utf8(text)
-        .ok()
-        .and_then(|digits| digits.parse::<f64>().ok())
-        .ok_or(IntervalError::InvalidSyntax)
-}
-
-/// `ParseFractionalSecond`, a fraction as whole microseconds.
-fn parse_fractional_second(text: &[u8]) -> Result<i32, IntervalError> {
-    let fraction = parse_fraction(text)?;
-    Ok(truncate_to_i32(round_ties_even(fraction * 1_000_000.0)))
 }
 
 /// `AdjustFractMicroseconds`, adding `frac * scale` microseconds with a remainder above one half
@@ -790,9 +358,9 @@ fn decode_interval(tokens: &Tokens, range: u16) -> Result<(i32, ItmIn), Interval
     let mut parsing_unit_val = false;
     let mut fmask: u32 = 0;
     let mut kind = IGNORE_DTF;
-    let last = tokens.count.wrapping_sub(1);
+    let last = tokens.len().wrapping_sub(1);
 
-    for index in (0..tokens.count).rev() {
+    for index in (0..tokens.len()).rev() {
         let (text, field_kind) = tokens.field(index);
         let tmask: u32;
 

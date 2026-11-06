@@ -11,11 +11,11 @@ use core::{
 };
 
 pub use arithmetic::{IntervalSum, ShiftError};
+pub(crate) use decode::strtod;
 use decode::{
     INTERVAL_FULL_RANGE, RANGE_DAY, RANGE_HOUR, RANGE_MINUTE, RANGE_MONTH, RANGE_SECOND,
     RANGE_YEAR, interval_in,
 };
-pub(crate) use decode::{date_word_era, strtod};
 
 const USECS_PER_DAY: i128 = 86_400_000_000;
 const USECS_PER_SEC: u64 = 1_000_000;

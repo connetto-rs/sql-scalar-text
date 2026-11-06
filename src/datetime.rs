@@ -2,15 +2,18 @@
 //! stores them, printed by their output functions under `DateStyle` `ISO`, and converted into one
 //! another in a [`PgTimeZone`].
 
+mod decode;
 mod input;
 #[cfg(feature = "jiff")]
 mod jiff_conversions;
+pub(crate) mod tokens;
 
 use core::{cmp::Ordering, fmt};
 
+pub use decode::DateOrder;
 pub use input::{InputContext, parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 
-use crate::PgTimeZone;
+use crate::{PgTimeZone, PgType};
 
 pub(crate) const USECS_PER_SEC: i64 = 1_000_000;
 pub(crate) const USECS_PER_MINUTE: i64 = 60_000_000;
@@ -54,13 +57,23 @@ pub enum DateTimeError {
     /// [`InputContext`].
     #[error("the literal needs a time zone to read as timestamp with time zone")]
     NeedsTimeZone,
-    /// An abbreviation whose set names a zone that does not exist.
+    /// A zone name, or an abbreviation whose set names a zone, that does not exist.
     #[error("time zone not recognized")]
     TimeZoneNotRecognized,
-    /// A spelling this crate does not model. The readers take the ISO spelling
-    /// `YYYY-MM-DD[( |T)HH:MM[:SS[.f]][offset]]` that no `DateStyle` changes, followed by a zone
-    /// abbreviation or all-letter zone name and ` BC` or ` AD`, and the special words that need
-    /// no clock.
+    /// Text the type's input function cannot read.
+    #[error("invalid input syntax for type {}", .0.input_name())]
+    InvalidInputSyntax(PgType),
+    /// A date whose reading the `DateStyle` field order decides, read with no order in the
+    /// [`InputContext`].
+    #[error("the literal needs a DateStyle field order")]
+    NeedsDateOrder,
+    /// `now`, `today`, `tomorrow` or `yesterday` read with no current time in the
+    /// [`InputContext`].
+    #[error("the literal needs the current time")]
+    NeedsCurrentTime,
+    /// A `time` or `timetz` spelling this crate does not model. Those readers take
+    /// `HH:MM[:SS[.f]][offset]` followed by a zone abbreviation or all-letter zone name, and
+    /// `allballs`.
     #[error("date/time spelling not modelled")]
     Unsupported,
 }
@@ -590,26 +603,27 @@ pub(crate) fn timestamp2tm(micros: i64) -> (i32, i32, i32, i64) {
     (year, month, day, micros.rem_euclid(USECS_PER_DAY))
 }
 
-/// `date2j`, the Julian day of a proleptic Gregorian date within `IS_VALID_JULIAN`.
+/// `date2j`, the Julian day of a proleptic Gregorian date, wrapping past `int` as PostgreSQL's
+/// `-fwrapv` build does for a year far outside `IS_VALID_JULIAN`.
 pub(crate) const fn date2j(year: i32, month: i32, day: i32) -> i32 {
     let (year, month) = if month > 2 {
-        (year + 4800, month + 1)
+        (year.wrapping_add(4800), month + 1)
     } else {
-        (year + 4799, month + 13)
+        (year.wrapping_add(4799), month + 13)
     };
     let century = year / 100;
-    let mut julian = year * 365 - 32_167;
-    julian += year / 4 - century + century / 4;
-    julian + 7_834 * month / 256 + day
+    let mut julian = year.wrapping_mul(365).wrapping_sub(32_167);
+    julian = julian.wrapping_add(year / 4 - century + century / 4);
+    julian.wrapping_add(7_834 * month / 256).wrapping_add(day)
 }
 
-/// `j2date`, the proleptic Gregorian date of a Julian day from -1.
+/// `j2date`, the proleptic Gregorian date of a Julian day, in C's unsigned arithmetic that
+/// wraps for a day before -32044.
 pub(crate) const fn j2date(julian_day: i32) -> (i32, i32, i32) {
-    // Unsigned as in C, where the conversion wraps and every intermediate stays below 2^32.
     let mut julian = julian_day.cast_unsigned().wrapping_add(32_044);
     let mut quad = julian / 146_097;
     let extra = (julian - quad * 146_097) * 4 + 3;
-    julian += 60 + quad * 3 + extra / 146_097;
+    julian = julian.wrapping_add(60 + quad * 3 + extra / 146_097);
     quad = julian / 1_461;
     julian -= quad * 1_461;
     let mut year = julian * 4 / 1_461;

@@ -12,8 +12,8 @@ mod zone;
 
 pub use cast::{CastError, CastTarget, CastValue, CharLength, Literal, PgType, cast_literal};
 pub use datetime::{
-    DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz, parse_date,
-    parse_time, parse_timestamp, parse_timestamp_tz,
+    DateOrder, DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz,
+    parse_date, parse_time, parse_timestamp, parse_timestamp_tz,
 };
 pub use interval::{
     IntervalError, IntervalFields, IntervalSum, IntervalTypmod, PgInterval, ShiftError,
