@@ -1,6 +1,6 @@
 use sql_values::{
-    DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz, parse_date,
-    parse_time, parse_timestamp, parse_timestamp_tz,
+    DateTimeError, InputContext, PgTime, PgTimeTz, PgTimestampTz, parse_date, parse_time,
+    parse_timestamp, parse_timestamp_tz,
 };
 
 /// Which reader a corpus entry goes through.
@@ -324,56 +324,12 @@ fn refuses_temporal_negative_corpus() {
     }
 }
 
-/// Spellings PostgreSQL reads by `DateStyle`, by the clock, or by grammar the readers do not
-/// model are declined rather than misread.
+/// Spellings of `time` and `timetz` PostgreSQL reads by the clock or by grammar the readers do
+/// not model are declined rather than misread.
 #[test]
 fn declines_spellings_it_does_not_model() {
     let context = InputContext::new();
     let unsupported = Err(DateTimeError::Unsupported);
-    for text in [
-        "now",
-        "today",
-        "tomorrow",
-        "yesterday",
-        "Jan 8 1999",
-        "January 8, 99 BC",
-        "1999-1-8",
-        "01/02/2026",
-        "19990108",
-        "J2451545",
-        "2026-01-01 12:00 Europe/Rome",
-        "2026-01-01 12:00 PM",
-        "999-01-01",
-        "01000-01-01",
-        "2026-01-01 12:00:00.5.5",
-        "2026-01-01 12:00.5",
-        "2026-01-01 12:00+05.5",
-        "2026-01-01 12:00+ 05",
-        "2026-01-01 1:00",
-        "2026-01-01 12:00Z5",
-        "2026-01-01 12:00+05:",
-        "2026-01-01 12:00+05:30:00:00",
-        "2026-01-01 12:00:00.00000000000000000000000000000000000000000000000000000000",
-        "2026-0101",
-        "2026-01-011",
-        "2026-01-01 12:000",
-    ] {
-        assert_eq!(
-            PgDate::parse(text, context).map(|_| ()),
-            unsupported,
-            "{text}"
-        );
-        assert_eq!(
-            PgTimestamp::parse(text, context).map(|_| ()),
-            unsupported,
-            "{text}"
-        );
-        assert_eq!(
-            PgTimestampTz::parse(text, context).map(|_| ()),
-            unsupported,
-            "{text}"
-        );
-    }
     for text in [
         "now",
         "12:00 PM",

@@ -102,7 +102,14 @@ pub enum PgType {
 
 impl fmt::Display for PgType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.write_str(self.name())
+    }
+}
+
+impl PgType {
+    /// The name `format_type` gives the type.
+    const fn name(self) -> &'static str {
+        match self {
             Self::Boolean => "boolean",
             Self::Smallint => "smallint",
             Self::Integer => "integer",
@@ -114,7 +121,16 @@ impl fmt::Display for PgType {
             Self::Date => "date",
             Self::Timestamp => "timestamp without time zone",
             Self::TimestampTz => "timestamp with time zone",
-        })
+        }
+    }
+
+    /// The name the type's input function writes in its syntax error, which for `timestamp`
+    /// leaves out `without time zone`.
+    pub(crate) const fn input_name(self) -> &'static str {
+        match self {
+            Self::Timestamp => "timestamp",
+            other => other.name(),
+        }
     }
 }
 
@@ -170,7 +186,7 @@ pub enum CastValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum CastError {
     /// Text the target's input function cannot read.
-    #[error("invalid input syntax for type {0}")]
+    #[error("invalid input syntax for type {}", .0.input_name())]
     InvalidInputSyntax(PgType),
     /// Text the integer input function reads as a number beyond the type.
     #[error("value is out of range for type {0}")]
@@ -660,8 +676,11 @@ fn datetime_error(error: DateTimeError) -> CastError {
         DateTimeError::TimeZoneDisplacementOutOfRange => CastError::TimeZoneDisplacementOutOfRange,
         DateTimeError::DateOutOfRange => CastError::DateOutOfRange,
         DateTimeError::TimestampOutOfRange => CastError::TimestampOutOfRange,
+        DateTimeError::InvalidInputSyntax(pg_type) => CastError::InvalidInputSyntax(pg_type),
         DateTimeError::OutsideJiffRange
         | DateTimeError::NeedsTimeZone
+        | DateTimeError::NeedsDateOrder
+        | DateTimeError::NeedsCurrentTime
         | DateTimeError::TimeZoneNotRecognized
         | DateTimeError::Unsupported => CastError::Unsupported,
     }
