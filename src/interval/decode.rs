@@ -4,11 +4,9 @@
 //! Fractions are `f64` like PostgreSQL's `double`, since exact decimals round
 //! `'1.999999999 millisecond'` differently.
 
-use super::{
-    IntervalError, PgInterval,
-    float::{
-        fits_in_i32, fits_in_i64, int_to_f64, round_ties_even, truncate_to_i32, truncate_to_i64,
-    },
+use super::{IntervalError, PgInterval};
+use crate::float::{
+    fits_in_i32, fits_in_i64, int_to_f64, round_ties_even, truncate_to_i32, truncate_to_i64,
 };
 
 const MONTHS_PER_YEAR: i32 = 12;

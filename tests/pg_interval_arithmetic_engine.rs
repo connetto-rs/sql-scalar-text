@@ -15,9 +15,7 @@ use diesel::{
     prelude::*,
     sql_types::{Array, Text},
 };
-use sql_values::{
-    IntervalSum, PgInterval, ShiftError, parse_f64, parse_interval, parse_time, parse_timestamp,
-};
+use sql_values::{IntervalSum, PgInterval, parse_f64, parse_interval, parse_time, parse_timestamp};
 
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
 
@@ -109,8 +107,8 @@ const FACTORS: &[&str] = &[
     "NaN",
 ];
 
-/// Timestamps at month ends, leap days, the epoch, the first PostgreSQL holds and the last year
-/// `chrono` holds.
+/// Timestamps at month ends, leap days, the epoch, both ends of PostgreSQL's range and both
+/// infinities.
 const TIMESTAMPS: &[&str] = &[
     "2026-01-31 10:20:30.5",
     "2024-02-29 23:59:59.999",
@@ -125,6 +123,11 @@ const TIMESTAMPS: &[&str] = &[
     "9999-12-31 23:59:59",
     "262000-06-30 12:00:00",
     "262142-12-31 23:59:59.999999",
+    "100000-02-29 12:00:00",
+    "294276-11-30 00:00:00",
+    "294276-12-31 23:59:59.999999",
+    "infinity",
+    "-infinity",
 ];
 
 const TIMES: &[&str] = &[
@@ -132,6 +135,7 @@ const TIMES: &[&str] = &[
     "10:20:30.5",
     "12:00:00.000001",
     "23:59:59.999999",
+    "24:00:00",
 ];
 
 /// Rows summed in this order, which PostgreSQL never leaves a field's range for, so its answer is
@@ -244,37 +248,6 @@ fn compare(conn: &mut PgConnection, cases: Vec<(String, Answer)>, read: fn(Answe
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
-/// A timestamp result in PostgreSQL's words, where one `chrono` cannot hold is the text
-/// PostgreSQL prints for it and so is compared through [`chrono_answer`].
-fn timestamp_answer(result: Result<chrono::NaiveDateTime, ShiftError>) -> Answer {
-    match result {
-        Ok(at) => Ok(Some(at.format("%Y-%m-%d %H:%M:%S%.f").to_string())),
-        Err(ShiftError::Unrepresentable) => Ok(Some("beyond chrono".to_owned())),
-        Err(error) => Err(error.to_string()),
-    }
-}
-
-/// PostgreSQL's timestamp answer in the words of [`timestamp_answer`].
-fn chrono_answer(answer: Answer) -> Answer {
-    answer.map(|text| {
-        text.map(|text| match parse_timestamp(&text) {
-            Some(at) => at.format("%Y-%m-%d %H:%M:%S%.f").to_string(),
-            None => "beyond chrono".to_owned(),
-        })
-    })
-}
-
-/// PostgreSQL's time answer printed as `chrono` prints the time it reads as.
-fn time_answer(answer: Answer) -> Answer {
-    answer.map(|text| {
-        text.map(|text| {
-            parse_time(&text)
-                .unwrap_or_else(|| panic!("PostgreSQL printed time {text:?}"))
-                .to_string()
-        })
-    })
-}
-
 #[test]
 fn pg18_adds_subtracts_and_negates_every_pair() {
     let mut conn = connect();
@@ -345,12 +318,12 @@ fn pg18_shifts_every_timestamp() {
                         quoted(at),
                         quoted(span)
                     ),
-                    timestamp_answer(result),
+                    worded(result),
                 ));
             }
         }
     }
-    compare(&mut conn, cases, chrono_answer);
+    compare(&mut conn, cases, as_printed);
 }
 
 #[test]
@@ -398,7 +371,7 @@ fn pg18_shifts_every_time() {
             }
         }
     }
-    compare(&mut conn, cases, time_answer);
+    compare(&mut conn, cases, as_printed);
 }
 
 /// `sum` and `avg` of every group, folded in and also folded with an infinity and a total near a

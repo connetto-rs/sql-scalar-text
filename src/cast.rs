@@ -4,12 +4,9 @@
 use alloc::string::{String, ToString};
 use core::fmt;
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
-
 use crate::{
-    interval::{ShiftError, chrono_timestamp, pg_microseconds, pg_timestamp, valid_timestamp},
+    datetime::{DateTimeError, PgDate, PgTimestamp, PgTimestampTz},
     numeric::{NumericTypmod, PgNumeric},
-    parse_pg_offset, parse_two_digits,
 };
 
 /// A literal as written before `::`, its quotes and escapes already decoded.
@@ -160,12 +157,12 @@ pub enum CastValue {
     /// A `char(n)`, blank-padded to its length as PostgreSQL holds it. PostgreSQL drops the
     /// trailing blanks when it compares it with `text` or casts it to `text`.
     Bpchar(String),
-    /// A `date`, where year `Y` BC is year `1 - Y`.
-    Date(NaiveDate),
-    /// A `timestamp`, where year `Y` BC is year `1 - Y`.
-    Timestamp(NaiveDateTime),
-    /// A `timestamptz`, the instant PostgreSQL holds, printed as under `TimeZone` `UTC`.
-    TimestampTz(DateTime<Utc>),
+    /// A `date`.
+    Date(PgDate),
+    /// A `timestamp`.
+    Timestamp(PgTimestamp),
+    /// A `timestamptz`, printed as under `TimeZone` `UTC`.
+    TimestampTz(PgTimestampTz),
 }
 
 /// Why PostgreSQL refuses a cast, one variant per message it raises, or why this crate declines
@@ -197,6 +194,9 @@ pub enum CastError {
     /// A timestamp before 4714-11-24 BC.
     #[error("timestamp out of range")]
     TimestampOutOfRange,
+    /// An offset of 16 hours or more, or with minutes or seconds of 60 or more.
+    #[error("time zone displacement out of range")]
+    TimeZoneDisplacementOutOfRange,
     /// A numeric constant of a type with no cast to the target.
     #[error("cannot cast type {from} to {to}")]
     CannotCast {
@@ -206,9 +206,8 @@ pub enum CastError {
         to: PgType,
     },
     /// A literal or cast this crate does not model. A date or timestamp is read only in the
-    /// ISO spelling `YYYY-MM-DD[ HH:MM[:SS[.ffffff]][offset]][ BC]`, the one no session setting
-    /// changes, and a `timestamptz` only with its offset, since without one the session's
-    /// `TimeZone` decides the instant.
+    /// spellings [`PgDate::parse`] and [`PgTimestamp::parse`] read, and a `timestamptz` only
+    /// with its offset, since without one the session's `TimeZone` decides the instant.
     #[error("cast not modelled")]
     Unsupported,
 }
@@ -472,39 +471,18 @@ fn cast_quoted(text: &str, target: CastTarget) -> Result<CastValue, CastError> {
         CastTarget::Text | CastTarget::Varchar(_) | CastTarget::Bpchar(_) => {
             Ok(character(text, target))
         }
-        CastTarget::Date => {
-            let literal = read_datetime(text)?;
-            if (literal.year, literal.month, literal.day) < (-4713, 11, 24) {
-                return Err(CastError::DateOutOfRange);
-            }
-            literal.date().map(CastValue::Date)
-        }
+        CastTarget::Date => PgDate::parse(text)
+            .map(CastValue::Date)
+            .map_err(datetime_error),
         CastTarget::Timestamp(precision) => {
-            let literal = read_datetime(text)?;
-            if !literal.julian() {
-                return Err(CastError::TimestampOutOfRange);
-            }
-            let local = literal.date()?.and_time(literal.time);
-            let micros = pg_timestamp(local).map_err(shift_error)?;
-            let micros = round_timestamp(micros, precision);
-            chrono_timestamp(micros)
-                .map(CastValue::Timestamp)
-                .map_err(shift_error)
+            let at = PgTimestamp::parse(text).map_err(datetime_error)?;
+            let micros = adjust_timestamp_for_typmod(at.pg_micros(), precision);
+            Ok(CastValue::Timestamp(PgTimestamp::from_stored(micros)))
         }
         CastTarget::TimestampTz(precision) => {
-            let literal = read_datetime(text)?;
-            // Without an offset the instant depends on the session's `TimeZone`.
-            let offset = literal.offset.ok_or(CastError::Unsupported)?;
-            if !literal.julian() {
-                return Err(CastError::TimestampOutOfRange);
-            }
-            let local = pg_microseconds(literal.date()?.and_time(literal.time));
-            let utc = local - i64::from(offset.local_minus_utc()) * 1_000_000;
-            let micros = valid_timestamp(utc).map_err(shift_error)?;
-            let micros = round_timestamp(micros, precision);
-            chrono_timestamp(micros)
-                .map(|at| CastValue::TimestampTz(at.and_utc()))
-                .map_err(shift_error)
+            let at = PgTimestampTz::parse(text).map_err(datetime_error)?;
+            let micros = adjust_timestamp_for_typmod(at.pg_micros(), precision);
+            Ok(CastValue::TimestampTz(PgTimestampTz::from_stored(micros)))
         }
     }
 }
@@ -551,7 +529,7 @@ pub(crate) const fn is_pg_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
 }
 
-fn trim_pg_space(bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_pg_space(bytes: &[u8]) -> &[u8] {
     let start = bytes.iter().take_while(|&&b| is_pg_space(b)).count();
     let end = bytes
         .iter()
@@ -656,121 +634,16 @@ fn int_in(text: &str, bits: u32) -> Result<i64, IntInputError> {
     }
 }
 
-/// A date and time literal in the one spelling [`read_datetime`] reads, its fields valid.
-struct DateTimeLiteral {
-    /// The proleptic Gregorian year, where year `Y` BC is `1 - Y`.
-    year: i32,
-    month: u8,
-    day: u8,
-    time: NaiveTime,
-    offset: Option<FixedOffset>,
-}
-
-impl DateTimeLiteral {
-    /// `IS_VALID_JULIAN`'s lower bound, which `date2j` checks only to the month.
-    fn julian(&self) -> bool {
-        (self.year, self.month) >= (-4713, 11)
-    }
-
-    /// The date, or [`CastError::Unsupported`] past `chrono`'s last year.
-    fn date(&self) -> Result<NaiveDate, CastError> {
-        NaiveDate::from_ymd_opt(self.year, self.month.into(), self.day.into())
-            .ok_or(CastError::Unsupported)
-    }
-}
-
-/// Read `YYYY-MM-DD[ HH:MM[:SS[.ffffff]][offset]][ BC]` between blanks, the spelling `date_in`,
-/// `timestamp_in` and `timestamptz_in` read alike under every `DateStyle`.
-fn read_datetime(text: &str) -> Result<DateTimeLiteral, CastError> {
-    let unsupported = CastError::Unsupported;
-    let trimmed = trim_pg_space(text.as_bytes());
-    let (body, bc) = match trimmed.strip_suffix(b" BC") {
-        Some(body) => (body, true),
-        None => (trimmed, false),
-    };
-    let year_len = body.iter().take_while(|b| b.is_ascii_digit()).count();
-    if !(4..=9).contains(&year_len) || (year_len > 4 && body[0] == b'0') {
-        return Err(unsupported);
-    }
-    let (year_digits, rest) = body.split_at(year_len);
-    let year = year_digits
-        .iter()
-        .fold(0i32, |year, &digit| year * 10 + i32::from(digit - b'0'));
-    let Some((&[b'-', m1, m2, b'-', d1, d2], rest)) = rest.split_first_chunk() else {
-        return Err(unsupported);
-    };
-    let month = parse_two_digits(&[m1, m2]).ok_or(unsupported)?;
-    let day = parse_two_digits(&[d1, d2]).ok_or(unsupported)?;
-    let (time, offset) = match rest.split_first() {
-        None => (NaiveTime::MIN, None),
-        Some((b' ' | b'T', clock)) => read_clock(clock).ok_or(unsupported)?,
-        Some(_) => return Err(unsupported),
-    };
-    if year == 0 || !(1..=12).contains(&month) {
-        return Err(CastError::DateTimeFieldOutOfRange);
-    }
-    let year = if bc { 1 - year } else { year };
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let month_days = match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if !(1..=month_days).contains(&day) {
-        return Err(CastError::DateTimeFieldOutOfRange);
-    }
-    Ok(DateTimeLiteral {
-        year,
-        month,
-        day,
-        time,
-        offset,
-    })
-}
-
-/// Read `HH:MM[:SS[.ffffff]][offset]` within a day, or `None` past what [`read_datetime`] reads.
-fn read_clock(bytes: &[u8]) -> Option<(NaiveTime, Option<FixedOffset>)> {
-    let (&[h1, h2, b':', m1, m2], mut rest) = bytes.split_first_chunk()? else {
-        return None;
-    };
-    let mut second = 0;
-    let mut micros = 0;
-    if let Some((&[b':', s1, s2], after)) = rest.split_first_chunk() {
-        second = parse_two_digits(&[s1, s2])?;
-        rest = after;
-        if let Some((b'.', fraction)) = rest.split_first() {
-            let len = fraction.iter().take_while(|b| b.is_ascii_digit()).count();
-            if !(1..=6).contains(&len) {
-                return None;
-            }
-            let (digits, after) = fraction.split_at(len);
-            micros = digits
-                .iter()
-                .chain(core::iter::repeat_n(&b'0', 6 - len))
-                .fold(0u32, |micros, &digit| micros * 10 + u32::from(digit - b'0'));
-            rest = after;
-        }
-    }
-    let offset = match rest {
-        [] => None,
-        // `DecodeTimezone` refuses an offset of 16 hours or more.
-        _ => Some(parse_pg_offset(rest).filter(|o| o.local_minus_utc().abs() < 16 * 3600)?),
-    };
-    let time = NaiveTime::from_hms_micro_opt(
-        parse_two_digits(&[h1, h2])?.into(),
-        parse_two_digits(&[m1, m2])?.into(),
-        second.into(),
-        micros,
-    )?;
-    Some((time, offset))
-}
-
-/// `AdjustTimestampForTypmod`, rounding half away from 2000-01-01 to `precision` digits.
-fn round_timestamp(micros: i64, precision: Option<u8>) -> i64 {
+/// `AdjustTimestampForTypmod`, rounding a finite timestamp half away from 2000-01-01 to
+/// `precision` digits, with no range check after, as PostgreSQL rounds the last second of
+/// 294276 up to 294277-01-01.
+fn adjust_timestamp_for_typmod(micros: i64, precision: Option<u8>) -> i64 {
     let Some(precision @ 0..6) = precision else {
         return micros;
     };
+    if micros == i64::MAX || micros == i64::MIN {
+        return micros;
+    }
     let scale = 10i64.pow(6 - u32::from(precision));
     let offset = scale / 2;
     if micros >= 0 {
@@ -780,47 +653,15 @@ fn round_timestamp(micros: i64, precision: Option<u8>) -> i64 {
     }
 }
 
-fn shift_error(error: ShiftError) -> CastError {
+/// The cast error of a refusal by a date or time input function.
+fn datetime_error(error: DateTimeError) -> CastError {
     match error {
-        ShiftError::TimestampOutOfRange => CastError::TimestampOutOfRange,
-        _ => CastError::Unsupported,
+        DateTimeError::FieldValueOutOfRange => CastError::DateTimeFieldOutOfRange,
+        DateTimeError::TimeZoneDisplacementOutOfRange => CastError::TimeZoneDisplacementOutOfRange,
+        DateTimeError::DateOutOfRange => CastError::DateOutOfRange,
+        DateTimeError::TimestampOutOfRange => CastError::TimestampOutOfRange,
+        DateTimeError::NeedsTimeZone | DateTimeError::Unsupported => CastError::Unsupported,
     }
-}
-
-/// PostgreSQL's ISO date, `Y BC` for year `1 - Y` with the era left to the caller.
-fn write_date(f: &mut fmt::Formatter<'_>, date: NaiveDate) -> fmt::Result {
-    let year = date.year();
-    let shown = if year > 0 { year } else { 1 - year };
-    write!(f, "{shown:04}-{:02}-{:02}", date.month(), date.day())
-}
-
-/// `EncodeDateTime` under `DateStyle` `ISO`, with `+00` for a `timestamptz` in `UTC`.
-fn write_timestamp(f: &mut fmt::Formatter<'_>, at: NaiveDateTime, zone: bool) -> fmt::Result {
-    write_date(f, at.date())?;
-    let time = at.time();
-    write!(
-        f,
-        " {:02}:{:02}:{:02}",
-        time.hour(),
-        time.minute(),
-        time.second()
-    )?;
-    let mut micros = time.nanosecond() / 1_000;
-    if micros > 0 {
-        let mut width = 6;
-        while micros.is_multiple_of(10) {
-            micros /= 10;
-            width -= 1;
-        }
-        write!(f, ".{micros:0width$}")?;
-    }
-    if zone {
-        f.write_str("+00")?;
-    }
-    if at.year() <= 0 {
-        f.write_str(" BC")?;
-    }
-    Ok(())
 }
 
 /// Each type's output function under `DateStyle` `ISO` and `TimeZone` `UTC`.
@@ -833,15 +674,9 @@ impl fmt::Display for CastValue {
             Self::Bigint(value) => write!(f, "{value}"),
             Self::Numeric(value) => write!(f, "{value}"),
             Self::Text(text) | Self::Bpchar(text) => f.write_str(text),
-            Self::Date(date) => {
-                write_date(f, *date)?;
-                if date.year() <= 0 {
-                    f.write_str(" BC")?;
-                }
-                Ok(())
-            }
-            Self::Timestamp(at) => write_timestamp(f, *at, false),
-            Self::TimestampTz(at) => write_timestamp(f, at.naive_utc(), true),
+            Self::Date(date) => write!(f, "{date}"),
+            Self::Timestamp(at) => write!(f, "{at}"),
+            Self::TimestampTz(at) => write!(f, "{at}"),
         }
     }
 }
