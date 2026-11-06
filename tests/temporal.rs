@@ -1,6 +1,6 @@
 use sql_values::{
-    DateTimeError, InputContext, PgTime, PgTimeTz, PgTimestampTz, parse_date, parse_time,
-    parse_timestamp, parse_timestamp_tz,
+    DateTimeError, InputContext, PgTimeTz, PgTimestampTz, parse_date, parse_time, parse_timestamp,
+    parse_timestamp_tz,
 };
 
 /// Which reader a corpus entry goes through.
@@ -288,6 +288,7 @@ fn refuses_temporal_negative_corpus() {
     }
     for text in [
         "20260101",
+        "99999999999-01-01",
         "nope",
         "",
         "+10000-01-01",
@@ -324,48 +325,23 @@ fn refuses_temporal_negative_corpus() {
     }
 }
 
-/// Spellings of `time` and `timetz` PostgreSQL reads by the clock or by grammar the readers do
-/// not model are declined rather than misread.
+/// A `timetz` whose offset the date decides, written without one, takes the current date in
+/// the session's time zone, which the context must give.
 #[test]
-fn declines_spellings_it_does_not_model() {
-    let context = InputContext::new();
-    let unsupported = Err(DateTimeError::Unsupported);
-    for text in [
-        "now",
-        "12:00 PM",
-        "1:00",
-        "12:00 Europe/Rome",
-        "2026-01-01 12:00",
-        "040506",
-        "12:00:00.000000000000000000000000000000000000000000000000000000000",
-        "12:00 BC",
-    ] {
+fn timetz_without_a_date_needs_the_current_time() {
+    let start = PgTimestampTz::parse("2026-01-15 12:00+00", InputContext::new()).expect("a start");
+    for text in ["12:00", "12:00 MSK", "now"] {
         assert_eq!(
-            PgTime::parse(text, context).map(|_| ()),
-            unsupported,
+            PgTimeTz::parse(text, InputContext::new()),
+            Err(DateTimeError::NeedsCurrentTime),
             "{text}"
         );
         assert_eq!(
-            PgTimeTz::parse(text, context).map(|_| ()),
-            unsupported,
+            PgTimeTz::parse(text, InputContext::new().with_now(start)),
+            Err(DateTimeError::NeedsTimeZone),
             "{text}"
         );
     }
-    // A `timetz` without an offset, or with a zone whose offset changes, takes the offset of
-    // the current date.
-    assert_eq!(PgTimeTz::parse("12:00", context).map(|_| ()), unsupported);
-    assert_eq!(
-        PgTimeTz::parse("12:00 Japan", context).map(|_| ()),
-        unsupported
-    );
-    assert_eq!(
-        PgTimeTz::parse("12:00 MSK", context).map(|_| ()),
-        unsupported
-    );
-    assert_eq!(
-        PgTimeTz::parse("12:00 Factory", context).map(|t| t.to_string()),
-        Ok("12:00:00+00".to_owned())
-    );
 }
 
 /// A `timestamptz` written without an offset needs the session's time zone.

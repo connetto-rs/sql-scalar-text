@@ -73,7 +73,16 @@ impl CharLength {
     }
 }
 
-/// A type PostgreSQL names in a cast's error.
+/// A type PostgreSQL names in a cast's error, printed as `format_type` names it.
+///
+/// ```
+/// use sql_values::{DateTimeError, PgType};
+///
+/// assert_eq!(PgType::Time.to_string(), "time without time zone");
+/// // `time_in` names the type `time` in its syntax error.
+/// let error = DateTimeError::InvalidInputSyntax(PgType::Time);
+/// assert_eq!(error.to_string(), "invalid input syntax for type time");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PgType {
     /// `boolean`.
@@ -98,6 +107,10 @@ pub enum PgType {
     Timestamp,
     /// `timestamp with time zone`.
     TimestampTz,
+    /// `time without time zone`.
+    Time,
+    /// `time with time zone`.
+    TimeTz,
 }
 
 impl fmt::Display for PgType {
@@ -121,14 +134,17 @@ impl PgType {
             Self::Date => "date",
             Self::Timestamp => "timestamp without time zone",
             Self::TimestampTz => "timestamp with time zone",
+            Self::Time => "time without time zone",
+            Self::TimeTz => "time with time zone",
         }
     }
 
     /// The name the type's input function writes in its syntax error, which for `timestamp`
-    /// leaves out `without time zone`.
+    /// and `time` leaves out `without time zone`.
     pub(crate) const fn input_name(self) -> &'static str {
         match self {
             Self::Timestamp => "timestamp",
+            Self::Time => "time",
             other => other.name(),
         }
     }
@@ -681,8 +697,7 @@ fn datetime_error(error: DateTimeError) -> CastError {
         | DateTimeError::NeedsTimeZone
         | DateTimeError::NeedsDateOrder
         | DateTimeError::NeedsCurrentTime
-        | DateTimeError::TimeZoneNotRecognized
-        | DateTimeError::Unsupported => CastError::Unsupported,
+        | DateTimeError::TimeZoneNotRecognized => CastError::Unsupported,
     }
 }
 

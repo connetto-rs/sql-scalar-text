@@ -1,6 +1,6 @@
-//! PostgreSQL 18's `DecodeDateTime`, with `DecodeDate`, `DecodeNumber`, `DecodeNumberField`,
-//! `DecodeTime`, `DecodeTimezone` and `ValidateDate`, ported from `datetime.c` with PostgreSQL's
-//! names and order of checks. The session state the C reads from globals, `DateOrder`, the
+//! PostgreSQL 18's `DecodeDateTime` and `DecodeTimeOnly`, with `DecodeDate`, `DecodeNumber`,
+//! `DecodeNumberField`, `DecodeTime`, `DecodeTimezone` and `ValidateDate`, ported from
+//! `datetime.c` with PostgreSQL's names and order of checks. The session state the C reads from globals, `DateOrder`, the
 //! session's `TimeZone` and the transaction's start, comes from the [`InputContext`].
 
 use alloc::{borrow::Cow, string::String};
@@ -71,7 +71,7 @@ impl Dterr {
 }
 
 /// `struct pg_tm` as the decoders fill it, with `fsec` beside it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Tm {
     pub(crate) year: i32,
     pub(crate) mon: i32,
@@ -107,7 +107,7 @@ pub(crate) enum DateType {
 }
 
 /// Where the offset of a `DTK_DATE` literal comes from, which `DecodeDateTime` resolves last.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum ZoneSource<'a> {
     /// `*tzp` set by the literal, seconds west of UTC.
     West(i32),
@@ -122,8 +122,19 @@ pub(crate) enum ZoneSource<'a> {
     Session,
 }
 
+/// What `DecodeTimeOnly` leaves its caller.
+#[derive(Debug)]
+pub(crate) struct DecodedTime<'a> {
+    pub(crate) tm: Tm,
+    /// Whether the literal writes a full date, which dates the zone's offset in place of the
+    /// current date.
+    pub(crate) dated: bool,
+    /// [`ZoneSource::Named`] only for a dated literal.
+    pub(crate) zone: ZoneSource<'a>,
+}
+
 /// What `DecodeDateTime` leaves its caller.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Decoded<'a> {
     pub(crate) dtype: DateType,
     pub(crate) tm: Tm,
@@ -276,10 +287,13 @@ pub(crate) fn decode_time(text: &[u8], tm: &mut Tm) -> Result<(), Dterr> {
     Ok(())
 }
 
-/// `time_overflows` on a clock `DecodeTime` read, whose minute, second and fraction are in
-/// range.
+/// `time_overflows` on a clock whose fields are not negative and whose fraction is within a
+/// second, as the decoders leave every clock.
 pub(crate) fn time_overflows(tm: &Tm) -> bool {
-    !(0..=HOURS_PER_DAY).contains(&tm.hour) || tm.clock() > USECS_PER_DAY
+    !(0..=HOURS_PER_DAY).contains(&tm.hour)
+        || !(0..60).contains(&tm.min)
+        || !(0..=60).contains(&tm.sec)
+        || tm.clock() > USECS_PER_DAY
 }
 
 /// C's `atoi` of digits, `strtol` saturating and then narrowed to `int`.
@@ -579,6 +593,35 @@ pub(crate) fn local_fields(
     Ok((tm, -offset))
 }
 
+/// A Julian day number after `j` or `julian`, with the fraction of the day after it, into `tm`,
+/// answering the fields it sets.
+fn julian_day(value: i32, fraction: &[u8], tm: &mut Tm) -> Result<u32, Dterr> {
+    let mut tmask = DTK_DATE_M;
+    (tm.year, tm.mon, tm.mday) = j2date(value);
+    if !fraction.is_empty() {
+        let fraction = parse_fraction(fraction)?;
+        // C's conversion of the `double` to `int64` truncates.
+        let time =
+            crate::float::truncate_to_i64(fraction * crate::float::int_to_f64(USECS_PER_DAY));
+        dt2time(time, tm);
+        tmask |= DTK_TIME_M;
+    }
+    Ok(tmask)
+}
+
+/// The `AM` or `PM` a literal writes, applied to its hour.
+fn apply_meridian(mer: i32, tm: &mut Tm) -> Result<(), Dterr> {
+    if mer != HR24 && tm.hour > HOURS_PER_DAY / 2 {
+        return Err(Dterr::FieldOverflow);
+    }
+    if mer == AM && tm.hour == HOURS_PER_DAY / 2 {
+        tm.hour = 0;
+    } else if mer == PM && tm.hour != HOURS_PER_DAY / 2 {
+        tm.hour += HOURS_PER_DAY / 2;
+    }
+    Ok(())
+}
+
 /// `dt2time`, a clock in microseconds as hours, minutes, seconds and the fraction.
 fn dt2time(time: i64, tm: &mut Tm) {
     let narrow = |value: i64| i32::try_from(value).expect("a Julian day's clock fits int");
@@ -691,18 +734,8 @@ pub(crate) fn decode_date_time<'a>(
                     }
                     match ptype {
                         DTK_JULIAN => {
-                            tmask = DTK_DATE_M;
-                            (tm.year, tm.mon, tm.mday) = j2date(value);
+                            tmask = julian_day(value, &field[end..], &mut tm)?;
                             isjulian = true;
-                            if end < field.len() {
-                                let fraction = parse_fraction(&field[end..])?;
-                                // C's conversion of the `double` to `int64` truncates.
-                                let time = crate::float::truncate_to_i64(
-                                    fraction * crate::float::int_to_f64(USECS_PER_DAY),
-                                );
-                                dt2time(time, &mut tm);
-                                tmask |= DTK_TIME_M;
-                            }
                         }
                         DTK_TIME => {
                             tmask = 0;
@@ -853,14 +886,7 @@ pub(crate) fn decode_date_time<'a>(
     let mut zone = ZoneSource::West(tz);
     if dtype == DateType::Date {
         validate_date(fmask, isjulian, is2digits, bc, &mut tm)?;
-        if mer != HR24 && tm.hour > HOURS_PER_DAY / 2 {
-            return Err(Dterr::FieldOverflow);
-        }
-        if mer == AM && tm.hour == HOURS_PER_DAY / 2 {
-            tm.hour = 0;
-        } else if mer == PM && tm.hour != HOURS_PER_DAY / 2 {
-            tm.hour += HOURS_PER_DAY / 2;
-        }
+        apply_meridian(mer, &mut tm)?;
         if fmask & DTK_DATE_M != DTK_DATE_M {
             return Err(Dterr::BadFormat);
         }
@@ -888,4 +914,242 @@ pub(crate) fn decode_date_time<'a>(
         }
     }
     Ok(Decoded { dtype, tm, zone })
+}
+
+/// `DecodeTimeOnly` over the tokens of a `time` or `timetz` literal, with `tzp` given as
+/// `time_in` and `timetz_in` give it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the port keeps `DecodeTimeOnly` whole, one arm per token type, as PostgreSQL does"
+)]
+pub(crate) fn decode_time_only<'a>(
+    tokens: &Tokens,
+    context: InputContext<'a>,
+) -> Result<DecodedTime<'a>, Dterr> {
+    let mut fmask: u32 = 0;
+    let mut ptype = 0;
+    let mut mer = HR24;
+    let mut isjulian = false;
+    let mut is2digits = false;
+    let mut bc = false;
+    let mut tm = Tm::default();
+    let mut tz: i32 = 0;
+    let mut named: Option<PgTimeZone> = None;
+    let mut abbreviated: Option<(Cow<'a, PgTimeZone>, String)> = None;
+    let order = context.date_order;
+    let count = tokens.len();
+    // A date is read only as the first field, before a time or with a date last.
+    let last_is_date = count >= 2 && tokens.field(count - 1).1 == FieldType::Date;
+    let second_is_time = count >= 2 && tokens.field(1).1 == FieldType::Time;
+
+    for index in 0..count {
+        let (field, kind) = tokens.field(index);
+        let mut tmask: u32;
+        match kind {
+            FieldType::Date => {
+                if index == 0 && (last_is_date || second_is_time) {
+                    tmask = 0;
+                    decode_date(field, fmask, &mut tmask, &mut is2digits, &mut tm, order)?;
+                } else if field[0].is_ascii_digit() {
+                    if fmask & DTK_TIME_M == DTK_TIME_M {
+                        return Err(Dterr::BadFormat);
+                    }
+                    let dash = field
+                        .iter()
+                        .position(|&b| b == b'-')
+                        .ok_or(Dterr::BadFormat)?;
+                    tz = decode_timezone(&field[dash..])?;
+                    tmask = 0;
+                    decode_number_field(
+                        &field[..dash],
+                        fmask | DTK_DATE_M,
+                        &mut tmask,
+                        &mut tm,
+                        &mut is2digits,
+                    )?;
+                    tmask |= dtk_m(TZ);
+                } else {
+                    let name = String::from_utf8_lossy(field);
+                    named = Some(PgTimeZone::load(&name).ok_or(Dterr::BadTimezone)?);
+                    tmask = dtk_m(TZ);
+                }
+            }
+            FieldType::Time => {
+                if ptype != 0 {
+                    if ptype != DTK_TIME {
+                        return Err(Dterr::BadFormat);
+                    }
+                    ptype = 0;
+                }
+                decode_time(field, &mut tm)?;
+                tmask = DTK_TIME_M;
+            }
+            FieldType::Tz => {
+                tz = decode_timezone(field)?;
+                tmask = dtk_m(TZ);
+            }
+            FieldType::Number => {
+                if ptype != 0 {
+                    // A number field is digits with an optional fraction.
+                    let (value, end, erange) = strtoint(field, 0);
+                    if erange {
+                        return Err(Dterr::FieldOverflow);
+                    }
+                    match ptype {
+                        DTK_JULIAN => {
+                            tmask = julian_day(value, &field[end..], &mut tm)?;
+                            isjulian = true;
+                        }
+                        DTK_TIME => {
+                            tmask = 0;
+                            // With the date marked set, a success reads a time.
+                            decode_number_field(
+                                field,
+                                fmask | DTK_DATE_M,
+                                &mut tmask,
+                                &mut tm,
+                                &mut is2digits,
+                            )?;
+                        }
+                        _ => return Err(Dterr::BadFormat),
+                    }
+                    ptype = 0;
+                } else {
+                    tmask = 0;
+                    match field.iter().position(|&b| b == b'.') {
+                        Some(_) if index == 0 && last_is_date => {
+                            decode_date(field, fmask, &mut tmask, &mut is2digits, &mut tm, order)?;
+                        }
+                        Some(point) if point <= 2 => return Err(Dterr::BadFormat),
+                        Some(_) => {
+                            decode_number_field(
+                                field,
+                                fmask | DTK_DATE_M,
+                                &mut tmask,
+                                &mut tm,
+                                &mut is2digits,
+                            )?;
+                        }
+                        None if field.len() > 4 => {
+                            decode_number_field(
+                                field,
+                                fmask | DTK_DATE_M,
+                                &mut tmask,
+                                &mut tm,
+                                &mut is2digits,
+                            )?;
+                        }
+                        None => decode_number(
+                            field,
+                            false,
+                            fmask | DTK_DATE_M,
+                            &mut tmask,
+                            &mut tm,
+                            &mut is2digits,
+                            order,
+                        )?,
+                    }
+                }
+            }
+            FieldType::String | FieldType::Special => {
+                let (kind, value) = match decode_word(field, context)? {
+                    WordType::Fixed { west, dst } => {
+                        tz = west;
+                        (if dst { DTZ } else { TZ }, 0)
+                    }
+                    WordType::Dynamic { zone, upper } => {
+                        abbreviated = Some((zone, upper));
+                        (DYNTZ, 0)
+                    }
+                    WordType::Table(kind, value) => (kind, value),
+                    WordType::Unknown => (UNKNOWN_FIELD, 0),
+                };
+                if kind == IGNORE_DTF {
+                    continue;
+                }
+                tmask = dtk_m(kind);
+                match kind {
+                    RESERV => match value {
+                        DTK_NOW => {
+                            tmask = DTK_TIME_M;
+                            (tm, _) = current_time(context)?;
+                        }
+                        DTK_ZULU => {
+                            tmask = DTK_TIME_M | dtk_m(TZ);
+                            (tm.hour, tm.min, tm.sec) = (0, 0, 0);
+                        }
+                        _ => return Err(Dterr::BadFormat),
+                    },
+                    DTZMOD => {
+                        tmask |= dtk_m(DTZ);
+                        tz -= value;
+                    }
+                    DTZ | DYNTZ => tmask |= dtk_m(TZ),
+                    TZ => {}
+                    AMPM => mer = value,
+                    ADBC => bc = value == 1,
+                    UNITS | ISOTIME => {
+                        tmask = 0;
+                        if ptype != 0 {
+                            return Err(Dterr::BadFormat);
+                        }
+                        ptype = value;
+                    }
+                    UNKNOWN_FIELD => {
+                        let name = String::from_utf8_lossy(field);
+                        named = Some(PgTimeZone::load(&name).ok_or(Dterr::BadFormat)?);
+                        tmask = dtk_m(TZ);
+                    }
+                    // `MONTH` and `DOW`.
+                    _ => return Err(Dterr::BadFormat),
+                }
+            }
+        }
+        if tmask & fmask != 0 {
+            return Err(Dterr::BadFormat);
+        }
+        fmask |= tmask;
+    }
+    if ptype != 0 {
+        return Err(Dterr::BadFormat);
+    }
+
+    validate_date(fmask, isjulian, is2digits, bc, &mut tm)?;
+    apply_meridian(mer, &mut tm)?;
+    if time_overflows(&tm) {
+        return Err(Dterr::FieldOverflow);
+    }
+    if fmask & DTK_TIME_M != DTK_TIME_M {
+        return Err(Dterr::BadFormat);
+    }
+    let modified = fmask & dtk_m(DTZMOD) != 0;
+    // `DecodeDate` and a Julian day set the date whole, so a literal has all of it or none.
+    let dated = fmask & DTK_DATE_M == DTK_DATE_M;
+    let mut zone = ZoneSource::West(tz);
+    if let Some(named) = named {
+        if modified {
+            return Err(Dterr::BadFormat);
+        }
+        zone = match named.fixed_offset() {
+            Some(east) => ZoneSource::West(-east),
+            None if dated => ZoneSource::Named(named),
+            None => return Err(Dterr::BadFormat),
+        };
+    }
+    if let Some((abbreviation_zone, upper)) = abbreviated {
+        if modified {
+            return Err(Dterr::BadFormat);
+        }
+        zone = ZoneSource::Abbreviation {
+            zone: abbreviation_zone,
+            upper,
+        };
+    }
+    if fmask & dtk_m(TZ) == 0 {
+        if modified {
+            return Err(Dterr::BadFormat);
+        }
+        zone = ZoneSource::Session;
+    }
+    Ok(DecodedTime { tm, dated, zone })
 }
