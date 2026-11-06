@@ -96,7 +96,8 @@ impl<'a> InputContext<'a> {
 
     /// The context with `now` as the transaction's start, which `now`, `today`, `tomorrow` and
     /// `yesterday` read, in the context's time zone, and whose date a `timetz` without a date
-    /// takes its zone's offset on.
+    /// takes its zone's offset on. An infinite `now` reads as
+    /// [`DateTimeError::TimestampOutOfRange`], as no transaction starts at one.
     #[must_use]
     pub const fn with_now(self, now: PgTimestampTz) -> Self {
         Self {

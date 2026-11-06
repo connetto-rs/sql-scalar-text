@@ -973,6 +973,23 @@ fn pg18_reads_the_current_time_words() {
         PgDate::parse("today", InputContext::new().with_now(start)),
         Err(DateTimeError::NeedsTimeZone)
     );
+    // A transaction's start is finite, and `timestamp2tm` refuses an infinity in any zone.
+    let fixed = PgTimeZone::parse("+14").expect("a fixed zone");
+    for (now, zone) in [
+        (PgTimestampTz::INFINITY, &zone),
+        (PgTimestampTz::INFINITY, &fixed),
+        (PgTimestampTz::NEG_INFINITY, &fixed),
+    ] {
+        let context = InputContext::new().with_time_zone(zone).with_now(now);
+        assert_eq!(
+            PgDate::parse("today", context),
+            Err(DateTimeError::TimestampOutOfRange)
+        );
+        assert_eq!(
+            PgTimestamp::parse("now", context),
+            Err(DateTimeError::TimestampOutOfRange)
+        );
+    }
 }
 
 /// Clocks at which the sets' abbreviations are read, on either side of Moscow's changes of 2011

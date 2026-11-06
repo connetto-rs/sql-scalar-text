@@ -573,11 +573,15 @@ pub(crate) fn current_time(context: InputContext<'_>) -> Result<(Tm, i32), Dterr
     local_fields(now, zone).map_err(Dterr::Other)
 }
 
-/// `timestamp2tm` in `zone`, the local fields of a finite instant and its offset west of UTC.
+/// `timestamp2tm` in `zone`, the local fields of an instant and its offset west of UTC, which
+/// refuses an infinity as out of range.
 pub(crate) fn local_fields(
     at: PgTimestampTz,
     zone: &PgTimeZone,
 ) -> Result<(Tm, i32), DateTimeError> {
+    if !at.is_finite() {
+        return Err(DateTimeError::TimestampOutOfRange);
+    }
     let offset = utc_offset(zone, at.pg_micros())?;
     let (year, mon, mday, clock) = timestamp2tm(at.pg_micros() + i64::from(offset) * USECS_PER_SEC);
     let tm = Tm {
