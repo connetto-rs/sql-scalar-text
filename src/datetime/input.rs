@@ -4,9 +4,10 @@
 use super::{
     DateTimeError, POSTGRES_EPOCH_JDATE, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz,
     USECS_PER_DAY, USECS_PER_HOUR, USECS_PER_MINUTE, USECS_PER_SEC, date2j, days_in_month,
-    is_valid_julian, tm2timestamp,
+    is_valid_julian, local_offset, tm2timestamp,
 };
 use crate::{
+    PgTimeZone,
     cast::{is_pg_space, trim_pg_space},
     float::{round_ties_even, truncate_to_i64},
 };
@@ -20,6 +21,42 @@ const MAX_LITERAL_LEN: usize = 64;
 const EPOCH_MICROS: i64 = -946_684_800_000_000;
 /// 1970-01-01, `epoch`, in days from 2000-01-01.
 const EPOCH_DAYS: i32 = -10_957;
+
+/// The session state PostgreSQL's input functions read, which the caller supplies.
+///
+/// ```
+/// use sql_values::{DateTimeError, InputContext, PgTimeZone, PgTimestampTz};
+///
+/// let rome = PgTimeZone::parse("Europe/Rome").unwrap();
+/// let local = "2026-07-01 12:00:00";
+/// assert_eq!(
+///     PgTimestampTz::parse(local, InputContext::new()),
+///     Err(DateTimeError::NeedsTimeZone),
+/// );
+/// let at = PgTimestampTz::parse(local, InputContext::new().with_time_zone(&rome)).unwrap();
+/// assert_eq!(at.to_string(), "2026-07-01 10:00:00+00");
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputContext<'a> {
+    time_zone: Option<&'a PgTimeZone>,
+}
+
+impl<'a> InputContext<'a> {
+    /// A context with no session state.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { time_zone: None }
+    }
+
+    /// The context with `zone` as the session's `TimeZone`, which reads a `timestamptz` written
+    /// without an offset.
+    #[must_use]
+    pub const fn with_time_zone(self, zone: &'a PgTimeZone) -> Self {
+        Self {
+            time_zone: Some(zone),
+        }
+    }
+}
 
 /// The reserved words `date_in`, `timestamp_in` and `timestamptz_in` read without a clock.
 enum Special {
@@ -397,15 +434,15 @@ impl PgDate {
     /// spelling.
     ///
     /// ```
-    /// use sql_values::{DateTimeError, PgDate};
+    /// use sql_values::{DateTimeError, InputContext, PgDate};
     ///
-    /// let read = |text| PgDate::parse(text).map(|d| d.to_string());
+    /// let read = |text| PgDate::parse(text, InputContext::new()).map(|d| d.to_string());
     /// assert_eq!(read("5874897-12-31").unwrap(), "5874897-12-31");
     /// assert_eq!(read(" -Infinity ").unwrap(), "-infinity");
     /// assert_eq!(read("2024-02-30"), Err(DateTimeError::FieldValueOutOfRange));
     /// assert_eq!(read("4714-11-23 BC"), Err(DateTimeError::DateOutOfRange));
     /// ```
-    pub fn parse(text: &str) -> Result<Self, DateTimeError> {
+    pub fn parse(text: &str, _context: InputContext<'_>) -> Result<Self, DateTimeError> {
         let fields = match read_date_time(text)? {
             Literal::Special(Special::Late) => return Ok(Self::INFINITY),
             Literal::Special(Special::Early) => return Ok(Self::NEG_INFINITY),
@@ -431,14 +468,14 @@ impl PgTimestamp {
     /// spelling.
     ///
     /// ```
-    /// use sql_values::{DateTimeError, PgTimestamp};
+    /// use sql_values::{DateTimeError, InputContext, PgTimestamp};
     ///
-    /// let read = |text| PgTimestamp::parse(text).map(|t| t.to_string());
+    /// let read = |text| PgTimestamp::parse(text, InputContext::new()).map(|t| t.to_string());
     /// assert_eq!(read("2024-12-31 24:00:00").unwrap(), "2025-01-01 00:00:00");
     /// assert_eq!(read("4714-11-24 00:00:00 BC").unwrap(), "4714-11-24 00:00:00 BC");
     /// assert_eq!(read("294277-01-01"), Err(DateTimeError::TimestampOutOfRange));
     /// ```
-    pub fn parse(text: &str) -> Result<Self, DateTimeError> {
+    pub fn parse(text: &str, _context: InputContext<'_>) -> Result<Self, DateTimeError> {
         match read_date_time(text)? {
             Literal::Special(Special::Late) => Ok(Self::INFINITY),
             Literal::Special(Special::Early) => Ok(Self::NEG_INFINITY),
@@ -454,32 +491,50 @@ impl PgTimestamp {
 
 impl PgTimestampTz {
     /// PostgreSQL's `timestamptz_in`, reading the ISO spelling and `infinity`, `-infinity` and
-    /// `epoch`.
+    /// `epoch`. A literal without an offset is local time in the context's time zone, resolved
+    /// as [`PgTimestamp::to_timestamptz`] resolves it.
     ///
     /// # Errors
     ///
     /// The [`DateTimeError`] PostgreSQL raises, [`DateTimeError::NeedsTimeZone`] for a literal
-    /// without an offset, whose instant the session's `TimeZone` decides, or
-    /// [`DateTimeError::Unsupported`] for another spelling.
+    /// without an offset and a context without a time zone,
+    /// [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about a clock outside
+    /// jiff's years, or [`DateTimeError::Unsupported`] for another spelling.
     ///
     /// ```
-    /// use sql_values::{DateTimeError, PgTimestampTz};
+    /// use sql_values::{DateTimeError, InputContext, PgTimestampTz};
     ///
-    /// let read = |text| PgTimestampTz::parse(text).map(|t| t.to_string());
+    /// let read = |text| PgTimestampTz::parse(text, InputContext::new()).map(|t| t.to_string());
     /// assert_eq!(read("2024-01-01 12:00+15:59:59").unwrap(), "2023-12-31 20:00:01+00");
     /// assert_eq!(read("2024-01-01 12:00+16"), Err(DateTimeError::TimeZoneDisplacementOutOfRange));
     /// ```
-    pub fn parse(text: &str) -> Result<Self, DateTimeError> {
+    pub fn parse(text: &str, context: InputContext<'_>) -> Result<Self, DateTimeError> {
         let fields = match read_date_time(text)? {
             Literal::Special(Special::Late) => return Ok(Self::INFINITY),
             Literal::Special(Special::Early) => return Ok(Self::NEG_INFINITY),
             Literal::Special(Special::Epoch) => return Ok(Self(EPOCH_MICROS)),
             Literal::Fields(fields) => fields,
         };
-        let offset = fields.offset.ok_or(DateTimeError::NeedsTimeZone)?;
+        let out_of_range = DateTimeError::TimestampOutOfRange;
+        let offset = match (fields.offset, context.time_zone) {
+            (Some(offset), _) => offset,
+            (None, None) => return Err(DateTimeError::NeedsTimeZone),
+            (None, Some(zone)) => {
+                if !is_valid_julian(fields.year, fields.month) {
+                    return Err(out_of_range);
+                }
+                let days = i64::from(date2j(fields.year, fields.month, fields.day))
+                    - i64::from(POSTGRES_EPOCH_JDATE);
+                let local = days
+                    .checked_mul(USECS_PER_DAY)
+                    .and_then(|micros| micros.checked_add(fields.clock))
+                    .ok_or(out_of_range)?;
+                local_offset(zone, local)?
+            }
+        };
         tm2timestamp(fields.year, fields.month, fields.day, fields.clock, offset)
             .map(Self)
-            .ok_or(DateTimeError::TimestampOutOfRange)
+            .ok_or(out_of_range)
     }
 }
 
@@ -493,14 +548,14 @@ impl PgTime {
     /// spelling.
     ///
     /// ```
-    /// use sql_values::{DateTimeError, PgTime};
+    /// use sql_values::{DateTimeError, InputContext, PgTime};
     ///
-    /// let read = |text| PgTime::parse(text).map(|t| t.to_string());
+    /// let read = |text| PgTime::parse(text, InputContext::new()).map(|t| t.to_string());
     /// assert_eq!(read("23:59:60").unwrap(), "24:00:00");
     /// assert_eq!(read("12:00:00.1234565").unwrap(), "12:00:00.123456");
     /// assert_eq!(read("24:00:00.000001"), Err(DateTimeError::FieldValueOutOfRange));
     /// ```
-    pub fn parse(text: &str) -> Result<Self, DateTimeError> {
+    pub fn parse(text: &str, _context: InputContext<'_>) -> Result<Self, DateTimeError> {
         Ok(Self(read_time(text)?.map_or(0, |(clock, _)| clock)))
     }
 }
@@ -516,13 +571,13 @@ impl PgTimeTz {
     /// spelling or a time without an offset.
     ///
     /// ```
-    /// use sql_values::PgTimeTz;
+    /// use sql_values::{InputContext, PgTimeTz};
     ///
-    /// let read = |text| PgTimeTz::parse(text).map(|t| t.to_string());
+    /// let read = |text| PgTimeTz::parse(text, InputContext::new()).map(|t| t.to_string());
     /// assert_eq!(read("12:00:00-05:30").unwrap(), "12:00:00-05:30");
     /// assert_eq!(read("allballs").unwrap(), "00:00:00+00");
     /// ```
-    pub fn parse(text: &str) -> Result<Self, DateTimeError> {
+    pub fn parse(text: &str, _context: InputContext<'_>) -> Result<Self, DateTimeError> {
         match read_time(text)? {
             None => Ok(Self { time: 0, offset: 0 }),
             Some((clock, Some(offset))) => Ok(Self {

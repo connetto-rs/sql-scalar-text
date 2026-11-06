@@ -5,10 +5,11 @@ use core::cmp::Ordering;
 
 use super::{IntervalError, PgInterval};
 use crate::{
-    PgTime, PgTimestamp,
+    DateTimeError, PgTime, PgTimeZone, PgTimestamp, PgTimestampTz,
     datetime::{
-        MONTHS_PER_YEAR, USECS_PER_DAY, USECS_PER_SEC, date2j, days_in_month, is_valid_timestamp,
-        j2date, timestamp2tm, tm2timestamp,
+        MONTHS_PER_YEAR, POSTGRES_EPOCH_JDATE, USECS_PER_DAY, USECS_PER_SEC, date2j, days_in_month,
+        is_valid_julian, is_valid_timestamp, j2date, local_offset, timestamp2tm, tm2timestamp,
+        utc_offset,
     },
     float::{
         fits_in_i32, fits_in_i64, int_to_f64, round_ties_even, truncate_to_i32, truncate_to_i64,
@@ -34,6 +35,9 @@ pub enum ShiftError {
     /// `time - interval` of an infinite interval.
     #[error("cannot subtract infinite interval from time")]
     InfiniteIntervalSubtractedFromTime,
+    /// An IANA time zone asked about an instant outside jiff's years -9999 to 9999.
+    #[error("value outside jiff's years -9999 to 9999")]
+    OutsideJiffRange,
 }
 
 impl PgInterval {
@@ -287,7 +291,7 @@ impl PgInterval {
     /// assert_eq!(month.add_to_timestamp(at).unwrap().to_string(), "2024-02-29 10:00:00");
     /// ```
     pub fn add_to_timestamp(self, at: PgTimestamp) -> Result<PgTimestamp, ShiftError> {
-        let shifted = self.shift(at.pg_micros())?;
+        let shifted = self.shift(at.pg_micros(), None)?;
         Ok(PgTimestamp::from_pg_micros(shifted).expect("a shifted timestamp is checked"))
     }
 
@@ -303,8 +307,54 @@ impl PgInterval {
             .add_to_timestamp(at)
     }
 
-    /// `timestamp_pl_interval` over the stored microseconds.
-    fn shift(self, at: i64) -> Result<i64, ShiftError> {
+    /// PostgreSQL's `timestamptz_pl_interval` with `zone` as the session's `TimeZone`,
+    /// `at + self`, with months and days added on the zone's calendar, each step's local clock
+    /// resolved as [`PgTimestamp::to_timestamptz`] resolves it, then the microseconds added to
+    /// the instant.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`add_to_timestamp`](Self::add_to_timestamp), and
+    /// [`ShiftError::OutsideJiffRange`] where an IANA zone is asked about an instant outside
+    /// jiff's years.
+    ///
+    /// ```
+    /// use sql_values::{InputContext, PgTimeZone, PgTimestampTz, parse_interval};
+    ///
+    /// let rome = PgTimeZone::parse("Europe/Rome").unwrap();
+    /// let at = PgTimestampTz::parse("2026-03-29 12:00:00+02", InputContext::new()).unwrap();
+    /// let day = parse_interval("1 day").unwrap();
+    /// let before = day.subtract_from_timestamptz(at, &rome).unwrap();
+    /// assert_eq!(before.to_string(), "2026-03-28 11:00:00+00");
+    /// ```
+    pub fn add_to_timestamptz(
+        self,
+        at: PgTimestampTz,
+        zone: &PgTimeZone,
+    ) -> Result<PgTimestampTz, ShiftError> {
+        let shifted = self.shift(at.pg_micros(), Some(zone))?;
+        Ok(PgTimestampTz::from_pg_micros(shifted).expect("a shifted timestamp is checked"))
+    }
+
+    /// PostgreSQL's `timestamptz_mi_interval`, `at - self`, which adds the negated interval.
+    ///
+    /// # Errors
+    ///
+    /// [`ShiftError::IntervalOutOfRange`] where `interval_um` refuses the interval, and the
+    /// errors of [`add_to_timestamptz`](Self::add_to_timestamptz).
+    pub fn subtract_from_timestamptz(
+        self,
+        at: PgTimestampTz,
+        zone: &PgTimeZone,
+    ) -> Result<PgTimestampTz, ShiftError> {
+        self.checked_neg()
+            .map_err(|_| ShiftError::IntervalOutOfRange)?
+            .add_to_timestamptz(at, zone)
+    }
+
+    /// `timestamp_pl_interval`, or `timestamptz_pl_interval` in `zone`, over the stored
+    /// microseconds.
+    fn shift(self, at: i64, zone: Option<&PgTimeZone>) -> Result<i64, ShiftError> {
         let out_of_range = ShiftError::TimestampOutOfRange;
         match self.infinity() {
             Some(Ordering::Less) if at == i64::MAX => return Err(out_of_range),
@@ -314,9 +364,35 @@ impl PgInterval {
             None if at == i64::MAX || at == i64::MIN => return Ok(at),
             None => {}
         }
+        // `timestamp2tm`, in the zone when there is one.
+        let local_fields = |utc: i64| -> Result<_, ShiftError> {
+            let offset = match zone {
+                None => 0,
+                Some(zone) => utc_offset(zone, utc).map_err(shift_error)?,
+            };
+            Ok(timestamp2tm(utc + i64::from(offset) * USECS_PER_SEC))
+        };
+        // `DetermineTimeZoneOffset` in the zone when there is one, then `tm2timestamp`.
+        let rebuild = |year: i32, month: i32, day: i32, clock: i64| {
+            if !is_valid_julian(year, month) {
+                return Err(out_of_range);
+            }
+            let offset = match zone {
+                None => 0,
+                Some(zone) => {
+                    let days = i64::from(date2j(year, month, day) - POSTGRES_EPOCH_JDATE);
+                    let local = days
+                        .checked_mul(USECS_PER_DAY)
+                        .and_then(|micros| micros.checked_add(clock))
+                        .ok_or(out_of_range)?;
+                    local_offset(zone, local).map_err(shift_error)?
+                }
+            };
+            tm2timestamp(year, month, day, clock, offset).ok_or(out_of_range)
+        };
         let mut timestamp = at;
         if self.months != 0 {
-            let (mut year, month, mut day, clock) = timestamp2tm(timestamp);
+            let (mut year, month, mut day, clock) = local_fields(timestamp)?;
             let mut month = month.checked_add(self.months).ok_or(out_of_range)?;
             // C's truncating division and remainder.
             if month > MONTHS_PER_YEAR {
@@ -327,16 +403,19 @@ impl PgInterval {
                 month = month % MONTHS_PER_YEAR + MONTHS_PER_YEAR;
             }
             day = day.min(days_in_month(year, month));
-            timestamp = tm2timestamp(year, month, day, clock, 0).ok_or(out_of_range)?;
+            timestamp = rebuild(year, month, day, clock)?;
         }
         if self.days != 0 {
-            let (year, month, day, clock) = timestamp2tm(timestamp);
+            let (year, month, day, clock) = local_fields(timestamp)?;
+            // `timestamp_pl_interval` refuses a Julian day below 0, and
+            // `timestamptz_pl_interval` one below -1, which a local date west of UTC reaches.
+            let lowest = if zone.is_some() { -1 } else { 0 };
             let julian = date2j(year, month, day)
                 .checked_add(self.days)
-                .filter(|julian| *julian >= 0)
+                .filter(|julian| *julian >= lowest)
                 .ok_or(out_of_range)?;
             let (year, month, day) = j2date(julian);
-            timestamp = tm2timestamp(year, month, day, clock, 0).ok_or(out_of_range)?;
+            timestamp = rebuild(year, month, day, clock)?;
         }
         timestamp
             .checked_add(self.microseconds)
@@ -431,6 +510,14 @@ struct FieldResults {
     months: Option<i32>,
     days: Option<i32>,
     microseconds: Option<i64>,
+}
+
+/// The shift error of a refusal by a zone lookup.
+fn shift_error(error: DateTimeError) -> ShiftError {
+    match error {
+        DateTimeError::OutsideJiffRange => ShiftError::OutsideJiffRange,
+        _ => ShiftError::TimestampOutOfRange,
+    }
 }
 
 /// The time of `moved` microseconds reduced into the day, as `time_pl_interval` reduces it.

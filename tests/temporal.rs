@@ -1,6 +1,6 @@
 use sql_values::{
-    DateTimeError, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz, parse_date, parse_time,
-    parse_timestamp, parse_timestamp_tz,
+    DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz, parse_date,
+    parse_time, parse_timestamp, parse_timestamp_tz,
 };
 
 /// Which reader a corpus entry goes through.
@@ -328,6 +328,7 @@ fn refuses_temporal_negative_corpus() {
 /// model are declined rather than misread.
 #[test]
 fn declines_spellings_it_does_not_model() {
+    let context = InputContext::new();
     let unsupported = Err(DateTimeError::Unsupported);
     for text in [
         "now",
@@ -359,10 +360,18 @@ fn declines_spellings_it_does_not_model() {
         "2026-01-01 12:000",
         "2026-01-01 12:00 zulu",
     ] {
-        assert_eq!(PgDate::parse(text).map(|_| ()), unsupported, "{text}");
-        assert_eq!(PgTimestamp::parse(text).map(|_| ()), unsupported, "{text}");
         assert_eq!(
-            PgTimestampTz::parse(text).map(|_| ()),
+            PgDate::parse(text, context).map(|_| ()),
+            unsupported,
+            "{text}"
+        );
+        assert_eq!(
+            PgTimestamp::parse(text, context).map(|_| ()),
+            unsupported,
+            "{text}"
+        );
+        assert_eq!(
+            PgTimestampTz::parse(text, context).map(|_| ()),
             unsupported,
             "{text}"
         );
@@ -376,21 +385,28 @@ fn declines_spellings_it_does_not_model() {
         "040506",
         "12:00:00.000000000000000000000000000000000000000000000000000000000",
     ] {
-        assert_eq!(PgTime::parse(text).map(|_| ()), unsupported, "{text}");
-        assert_eq!(PgTimeTz::parse(text).map(|_| ()), unsupported, "{text}");
+        assert_eq!(
+            PgTime::parse(text, context).map(|_| ()),
+            unsupported,
+            "{text}"
+        );
+        assert_eq!(
+            PgTimeTz::parse(text, context).map(|_| ()),
+            unsupported,
+            "{text}"
+        );
     }
     // A `timetz` without an offset takes the session's offset on the current date.
-    assert_eq!(PgTimeTz::parse("12:00").map(|_| ()), unsupported);
+    assert_eq!(PgTimeTz::parse("12:00", context).map(|_| ()), unsupported);
 }
 
-/// A `timestamptz` written without an offset needs the session's time zone, which the reader
-/// does not have.
+/// A `timestamptz` written without an offset needs the session's time zone.
 #[test]
 fn timestamptz_without_offset_needs_a_time_zone() {
     assert_eq!(
-        PgTimestampTz::parse("2026-01-01 12:00"),
+        PgTimestampTz::parse("2026-01-01 12:00", InputContext::new()),
         Err(DateTimeError::NeedsTimeZone)
     );
-    assert!(PgTimestampTz::parse("2026-01-01 12:00+00").is_ok());
-    assert!(PgTimestampTz::parse("epoch").is_ok());
+    assert!(PgTimestampTz::parse("2026-01-01 12:00+00", InputContext::new()).is_ok());
+    assert!(PgTimestampTz::parse("epoch", InputContext::new()).is_ok());
 }

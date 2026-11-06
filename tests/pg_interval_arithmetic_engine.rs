@@ -15,7 +15,10 @@ use diesel::{
     prelude::*,
     sql_types::{Array, Text},
 };
-use sql_values::{IntervalSum, PgInterval, parse_f64, parse_interval, parse_time, parse_timestamp};
+use sql_values::{
+    InputContext, IntervalSum, PgInterval, PgTimeZone, PgTimestampTz, ShiftError, parse_f64,
+    parse_interval, parse_time, parse_timestamp,
+};
 
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
 
@@ -136,6 +139,67 @@ const TIMES: &[&str] = &[
     "12:00:00.000001",
     "23:59:59.999999",
     "24:00:00",
+];
+
+/// Zones PostgreSQL's `TimeZone` names: daylight saving in the north and in the south, a zone
+/// that dropped it, a fixed offset, and POSIX rules.
+const ZONES: &[&str] = &[
+    "Europe/Rome",
+    "Australia/Sydney",
+    "America/Sao_Paulo",
+    "+02",
+    "EST5EDT,M3.2.0,M11.1.0",
+    "<-03>3<-02>,M10.1.0/0,M2.3.0/0",
+];
+
+/// Instants around each zone's 2026 changes, at local mean time, at PostgreSQL's first instant
+/// and a year inside jiff's last, and both infinities.
+const INSTANTS: &[&str] = &[
+    "2026-03-29 12:00:00+02",
+    "2026-03-28 01:30:00+00",
+    "2026-10-25 00:30:00+00",
+    "2026-10-24 23:59:59.999999+00",
+    "2026-04-04 15:30:00+00",
+    "2026-10-03 16:30:00+00",
+    "2026-03-08 06:30:00+00",
+    "2026-10-31 06:30:00+00",
+    "2026-01-31 23:00:00+00",
+    "1850-01-01 00:00:00+00",
+    "4714-11-24 00:00:00+00 BC",
+    "9998-11-01 00:00:00+00",
+    "infinity",
+    "-infinity",
+];
+
+/// Instants past jiff's years, which only the zones that need no jiff answer for.
+const FAR_INSTANTS: &[&str] = &[
+    "200000-06-15 12:00:00+00",
+    "294276-12-01 00:00:00+00",
+    "294276-12-31 23:59:59.999999+00",
+];
+
+/// The zones of [`ZONES`] that need no time zone database.
+const RULE_ZONES: &[&str] = &[
+    "+02",
+    "EST5EDT,M3.2.0,M11.1.0",
+    "<-03>3<-02>,M10.1.0/0,M2.3.0/0",
+];
+
+/// Intervals that cross a change by calendar units and by clock units.
+const ZONE_SPANS: &[&str] = &[
+    "1 day",
+    "-1 day",
+    "1 mon",
+    "-1 mon",
+    "24:00:00",
+    "-24:00:00",
+    "1 mon 1 day 01:00:00",
+    "-1 year -1 day",
+    "7 days 00:00:00.000001",
+    "-178956970 years -8 mons",
+    "1000000 years",
+    "infinity",
+    "-infinity",
 ];
 
 /// Rows summed in this order, which PostgreSQL never leaves a field's range for, so its answer is
@@ -372,6 +436,83 @@ fn pg18_shifts_every_time() {
         }
     }
     compare(&mut conn, cases, as_printed);
+}
+
+/// `timestamptz ± interval` under each zone as the session's `TimeZone`, the result printed at
+/// UTC so that both sides print the same instant.
+#[test]
+fn pg18_shifts_every_timestamptz_in_each_zone() {
+    let mut conn = connect();
+    let utc = PgTimeZone::parse("UTC").expect("UTC");
+    for &name in ZONES {
+        let zone = PgTimeZone::parse(name).unwrap_or_else(|error| panic!("{name:?}: {error}"));
+        // Raw SQL: `SET TIME ZONE` is a session command with no DSL form.
+        diesel::sql_query(format!("SET TIME ZONE {}", quoted(name)))
+            .execute(&mut conn)
+            .expect("set the zone");
+        let mut cases = Vec::new();
+        let far: &[&str] = if RULE_ZONES.contains(&name) {
+            FAR_INSTANTS
+        } else {
+            &[]
+        };
+        for &at in INSTANTS.iter().chain(far) {
+            let instant = PgTimestampTz::parse(at, InputContext::new())
+                .unwrap_or_else(|error| panic!("{at:?}: {error}"));
+            for &span in ZONE_SPANS {
+                for (operator, result) in [
+                    ("+", interval(span).add_to_timestamptz(instant, &zone)),
+                    (
+                        "-",
+                        interval(span).subtract_from_timestamptz(instant, &zone),
+                    ),
+                ] {
+                    let printed = match result {
+                        Ok(shifted) => worded(shifted.to_timestamp(&utc)),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    cases.push((
+                        format!(
+                            "SELECT (({}::timestamptz {operator} {}::interval) AT TIME ZONE 'UTC')::text",
+                            quoted(at),
+                            quoted(span)
+                        ),
+                        printed,
+                    ));
+                }
+            }
+        }
+        compare(&mut conn, cases, as_printed);
+    }
+}
+
+/// An IANA zone asked about a local clock past jiff's years refuses, naming jiff's bound.
+#[test]
+fn shifts_in_an_iana_zone_refuse_past_jiff_years() {
+    let rome = PgTimeZone::parse("Europe/Rome").expect("Europe/Rome");
+    let late = PgTimestampTz::parse("9999-12-20 00:00:00+00", InputContext::new()).expect("late");
+    assert_eq!(
+        interval("1 mon").add_to_timestamptz(late, &rome),
+        Err(ShiftError::OutsideJiffRange)
+    );
+    assert_eq!(
+        ShiftError::OutsideJiffRange.to_string(),
+        "value outside jiff's years -9999 to 9999"
+    );
+    // A clock past PostgreSQL's range by more than any offset is out of range in every zone,
+    // as PostgreSQL 18.6 answers.
+    let start = PgTimestampTz::parse("9998-11-05 00:00:00+00", InputContext::new()).expect("9998");
+    assert_eq!(
+        interval("284278 years 2 mons").add_to_timestamptz(start, &rome),
+        Err(ShiftError::TimestampOutOfRange)
+    );
+    let early = PgTimestampTz::parse("2026-01-01 00:00:00+00", InputContext::new()).expect("2026");
+    assert_eq!(
+        interval("1 mon")
+            .add_to_timestamptz(early, &rome)
+            .map(|at| at.to_string()),
+        Ok("2026-02-01 00:00:00+00".to_owned())
+    );
 }
 
 /// `sum` and `avg` of every group, folded in and also folded with an infinity and a total near a

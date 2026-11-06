@@ -1223,7 +1223,7 @@ fn adjust_interval_for_typmod(
 
 /// `strtod` past a first byte that is not `+`, answering the value, where it ends, and whether C
 /// reports `ERANGE`.
-fn strtod(text: &[u8], start: usize) -> Option<(f64, usize, bool)> {
+pub(crate) fn strtod(text: &[u8], start: usize) -> Option<(f64, usize, bool)> {
     let byte = |index: usize| text.get(index).copied().unwrap_or(0);
     let negative = byte(start) == b'-';
     let mut at = if negative { start + 1 } else { start };

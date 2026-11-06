@@ -11,6 +11,7 @@ use core::{
 };
 
 pub use arithmetic::{IntervalSum, ShiftError};
+pub(crate) use decode::strtod;
 use decode::{
     INTERVAL_FULL_RANGE, RANGE_DAY, RANGE_HOUR, RANGE_MINUTE, RANGE_MONTH, RANGE_SECOND,
     RANGE_YEAR, interval_in,
