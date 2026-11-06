@@ -26,6 +26,9 @@ jiff = { version = "0.2.39", default-features = false, features = ["alloc", "tzd
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
 thiserror = { version = "2", default-features = false }
 
+[build-dependencies]
+thiserror = { version = "2", default-features = false }
+
 [dev-dependencies]
 testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "mysql", "blocking"] }

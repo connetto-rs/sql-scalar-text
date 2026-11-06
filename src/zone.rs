@@ -1,24 +1,147 @@
 //! PostgreSQL 18's `TimeZone` setting as `check_timezone`, `pg_tzset` and `tzparse` read it, and the
 //! offsets `pg_localtime` and `DetermineTimeZoneOffset` find in a zone.
 //!
-//! IANA zones come from jiff's bundled database, which is asked only for a zone's offset at an
-//! instant and for its next transition. Fixed offsets and POSIX rules are ported and hold over
-//! PostgreSQL's whole range.
+//! IANA zones come from jiff's bundled database, which is asked only for a zone's offset and
+//! abbreviation at an instant and for its transitions. Fixed offsets and POSIX rules are ported
+//! and hold over PostgreSQL's whole range.
+//!
+//! The `timezone_abbreviations` sets PostgreSQL installs are bundled from its source, under the
+//! PostgreSQL license in `zone/timezonesets/COPYRIGHT`.
 
-use alloc::string::{String, ToString};
+mod tznames;
+
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::{
     fmt,
     hash::{Hash, Hasher},
 };
 
 use jiff::{Timestamp, tz::TimeZone};
+use tznames::Abbreviation;
+pub(crate) use tznames::Meaning;
+pub use tznames::TimeZoneAbbreviationsError;
 
 use crate::{
-    IntervalError,
+    DateTimeError, IntervalError,
     datetime::{date2j, days_in_month, j2date},
     interval::strtod,
     parse_interval,
 };
+
+/// The bundled sets as static tables, which the build script writes with the parser in
+/// `tznames`.
+mod bundled {
+    use alloc::borrow::Cow;
+
+    use super::tznames::{Abbreviation, Meaning};
+
+    include!(concat!(env!("OUT_DIR"), "/timezone_abbreviations.rs"));
+}
+
+/// 2200-01-01 00:00:00 UTC in seconds from 1970, where a scan of an IANA zone's abbreviations
+/// stops, past every rule change the database records and a century of the POSIX rules that
+/// then only repeat the same abbreviations.
+const ABBREVIATION_SCAN_END: i64 = 7_258_118_400;
+
+/// A `timezone_abbreviations` set, the abbreviations a literal may write for its zone.
+///
+/// ```
+/// use sql_values::{TimeZoneAbbreviations, TimeZoneAbbreviationsError};
+///
+/// let local = |name: &str| Some(match name {
+///     "Local" => "@INCLUDE Default\n@OVERRIDE\nIST 19800 # India\n",
+///     other => TimeZoneAbbreviations::bundled_file(other)?,
+/// });
+/// assert!(TimeZoneAbbreviations::load("Local", local).is_ok());
+/// let clash = |name: &str| match name {
+///     "Clash" => Some("@INCLUDE Default\nIST 19800\n"),
+///     other => TimeZoneAbbreviations::bundled_file(other),
+/// };
+/// assert_eq!(
+///     TimeZoneAbbreviations::load("Clash", clash),
+///     Err(TimeZoneAbbreviationsError::MultiplyDefined {
+///         abbreviation: "ist".to_owned(),
+///         file: "Clash".to_owned(),
+///         line: 2,
+///     }),
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TimeZoneAbbreviations {
+    entries: Cow<'static, [Abbreviation]>,
+}
+
+/// `Default`, the set `timezone_abbreviations` names in a stock installation.
+pub(crate) static DEFAULT_ABBREVIATIONS: TimeZoneAbbreviations = TimeZoneAbbreviations {
+    entries: Cow::Borrowed(&bundled::DEFAULT),
+};
+static AUSTRALIA: TimeZoneAbbreviations = TimeZoneAbbreviations {
+    entries: Cow::Borrowed(&bundled::AUSTRALIA),
+};
+static INDIA: TimeZoneAbbreviations = TimeZoneAbbreviations {
+    entries: Cow::Borrowed(&bundled::INDIA),
+};
+
+impl TimeZoneAbbreviations {
+    /// The set PostgreSQL installs as `name`, `Default`, `Australia` or `India`, as
+    /// `timezone_abbreviations` names it.
+    #[must_use]
+    pub fn bundled(name: &str) -> Option<&'static Self> {
+        match name {
+            "Default" => Some(&DEFAULT_ABBREVIATIONS),
+            "Australia" => Some(&AUSTRALIA),
+            "India" => Some(&INDIA),
+            _ => None,
+        }
+    }
+
+    /// The text of the file PostgreSQL installs as `name`, for a set of its own that includes
+    /// one.
+    #[must_use]
+    pub fn bundled_file(name: &str) -> Option<&'static str> {
+        match name {
+            "Default" => Some(include_str!("zone/timezonesets/Default")),
+            "Australia" => Some(include_str!("zone/timezonesets/Australia")),
+            "India" => Some(include_str!("zone/timezonesets/India")),
+            _ => None,
+        }
+    }
+
+    /// PostgreSQL 18's `load_tzoffsets`, the set of the file `name`, which `files` holds with
+    /// every file it includes, as PostgreSQL's `timezonesets` directory holds them.
+    ///
+    /// # Errors
+    ///
+    /// The [`TimeZoneAbbreviationsError`] PostgreSQL raises for the file or one it includes.
+    pub fn load<'f>(
+        name: &str,
+        mut files: impl FnMut(&str) -> Option<&'f str>,
+    ) -> Result<Self, TimeZoneAbbreviationsError> {
+        let mut entries = Vec::new();
+        tznames::parse_file(name, 0, &mut files, &mut entries)?;
+        Ok(Self {
+            entries: Cow::Owned(entries),
+        })
+    }
+
+    /// The meaning of the lowercased `word`, as `datebsearch` finds it.
+    pub(crate) fn lookup(&self, word: &[u8]) -> Option<&Meaning> {
+        tznames::search(&self.entries, word).map(|entry| &entry.meaning)
+    }
+}
+
+/// What an abbreviation means in the zone that uses it, as `pg_timezone_abbrev_is_known` and
+/// `pg_interpret_timezone_abbrev` find it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AbbreviationUse {
+    /// Seconds east of UTC.
+    pub(crate) offset: i32,
+    pub(crate) dst: bool,
+}
 
 const SECS_PER_MINUTE: i32 = 60;
 const SECS_PER_HOUR: i32 = 3_600;
@@ -82,10 +205,14 @@ pub struct PgTimeZone {
 /// How a zone's offset is found.
 #[derive(Debug, Clone)]
 enum Rules {
-    /// One offset east of UTC, in seconds, forever.
-    Fixed(i32),
-    /// A POSIX specification with daylight saving time.
-    Posix(Posix),
+    /// One offset east of UTC, in seconds, forever, and its abbreviation.
+    Fixed { offset: i32, abbreviation: String },
+    /// A POSIX specification with daylight saving time, and its two abbreviations.
+    Posix {
+        rules: Posix,
+        std_name: String,
+        dst_name: String,
+    },
     /// An IANA zone with transitions, from jiff's database.
     Iana(TimeZone),
 }
@@ -125,7 +252,7 @@ struct Spec<'a> {
     at: usize,
 }
 
-impl Spec<'_> {
+impl<'a> Spec<'a> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.at).copied()
     }
@@ -140,15 +267,15 @@ impl Spec<'_> {
         self.at == self.bytes.len()
     }
 
-    /// `getzname` or `getqzname`, the length of the abbreviation read.
-    fn name(&mut self) -> Option<usize> {
+    /// `getzname` or `getqzname`, the abbreviation read.
+    fn name(&mut self) -> Option<&'a [u8]> {
         if self.eat(b'<') {
             let start = self.at;
             while self.peek().is_some_and(|b| b != b'>') {
                 self.at += 1;
             }
-            let len = self.at - start;
-            self.eat(b'>').then_some(len)
+            let name = &self.bytes[start..self.at];
+            self.eat(b'>').then_some(name)
         } else {
             let start = self.at;
             while self
@@ -157,7 +284,7 @@ impl Spec<'_> {
             {
                 self.at += 1;
             }
-            Some(self.at - start)
+            Some(&self.bytes[start..self.at])
         }
     }
 
@@ -236,15 +363,20 @@ fn tzparse(spec: &str) -> Option<Rules> {
         bytes: spec.as_bytes(),
         at: 0,
     };
-    cursor.name()?;
+    let text = |name: &[u8]| String::from_utf8_lossy(name).into_owned();
+    let std_name = text(cursor.name()?);
     if cursor.is_done() {
         return None;
     }
     let std_offset = cursor.offset()?;
     if cursor.is_done() {
-        return Some(Rules::Fixed(-std_offset));
+        return Some(Rules::Fixed {
+            offset: -std_offset,
+            abbreviation: std_name,
+        });
     }
-    if cursor.name()? == 0 {
+    let dst_name = text(cursor.name()?);
+    if dst_name.is_empty() {
         return None;
     }
     let dst_offset = if cursor.is_done() || matches!(cursor.peek(), Some(b',' | b';')) {
@@ -279,7 +411,11 @@ fn tzparse(spec: &str) -> Option<Rules> {
         switches: false,
     };
     posix.switches = (2000..2000 + YEARS_PER_REPEAT).any(|year| posix.year(year).is_some());
-    Some(Rules::Posix(posix))
+    Some(Rules::Posix {
+        rules: posix,
+        std_name,
+        dst_name,
+    })
 }
 
 /// C's `isleap`.
@@ -493,28 +629,40 @@ impl PgTimeZone {
                 clock += &alloc::format!(":{:02}", magnitude % 60);
             }
         }
-        let name = if west > 0 {
-            alloc::format!("<-{clock}>+{clock}")
+        let (abbreviation, name) = if west > 0 {
+            (
+                alloc::format!("-{clock}"),
+                alloc::format!("<-{clock}>+{clock}"),
+            )
         } else {
-            alloc::format!("<+{clock}>-{clock}")
+            (
+                alloc::format!("+{clock}"),
+                alloc::format!("<+{clock}>-{clock}"),
+            )
         };
         let west = i32::try_from(west).expect("an offset under 168 hours fits int");
         Ok(Self {
             name,
-            rules: Rules::Fixed(-west),
+            rules: Rules::Fixed {
+                offset: -west,
+                abbreviation,
+            },
         })
     }
 
     /// `pg_tzset`, loading `GMT`, an IANA name, or an uppercased POSIX specification.
-    fn load(name: &str) -> Option<Self> {
+    pub(crate) fn load(name: &str) -> Option<Self> {
         if name.len() > TZ_STRLEN_MAX {
             return None;
         }
         let upper = name.to_ascii_uppercase();
         if upper == "GMT" {
             return Some(Self {
-                name: upper,
-                rules: Rules::Fixed(0),
+                name: upper.clone(),
+                rules: Rules::Fixed {
+                    offset: 0,
+                    abbreviation: upper,
+                },
             });
         }
         // `tzload` drops one leading colon, and a name that keeps one is no POSIX specification.
@@ -527,7 +675,13 @@ impl PgTimeZone {
             let canonical = zone.iana_name().unwrap_or(file).to_string();
             // A zone with no transitions keeps its one offset beyond jiff's years too.
             let rules = match zone.following(Timestamp::MIN).next() {
-                None => Rules::Fixed(zone.to_offset(Timestamp::MIN).seconds()),
+                None => {
+                    let info = zone.to_offset_info(Timestamp::MIN);
+                    Rules::Fixed {
+                        offset: info.offset().seconds(),
+                        abbreviation: info.abbreviation().to_string(),
+                    }
+                }
                 Some(_) => Rules::Iana(zone),
             };
             return Some(Self {
@@ -552,8 +706,8 @@ impl PgTimeZone {
     /// `None` where an IANA zone is asked about an instant outside jiff's years.
     pub(crate) fn utc_offset(&self, unix: i64) -> Option<i32> {
         match &self.rules {
-            Rules::Fixed(offset) => Some(*offset),
-            Rules::Posix(posix) => Some(posix.offset_at(unix)),
+            Rules::Fixed { offset, .. } => Some(*offset),
+            Rules::Posix { rules, .. } => Some(rules.offset_at(unix)),
             Rules::Iana(zone) => Some(zone.to_offset(Timestamp::from_second(unix).ok()?).seconds()),
         }
     }
@@ -562,8 +716,10 @@ impl PgTimeZone {
     /// and the offset east after it, as `pg_next_dst_boundary` finds them.
     fn next_boundary(&self, unix: i64) -> Option<(i32, Option<(i64, i32)>)> {
         match &self.rules {
-            Rules::Fixed(offset) => Some((*offset, None)),
-            Rules::Posix(posix) => Some((posix.offset_at(unix), posix.next_transition(unix))),
+            Rules::Fixed { offset, .. } => Some((*offset, None)),
+            Rules::Posix { rules, .. } => {
+                Some((rules.offset_at(unix), rules.next_transition(unix)))
+            }
             Rules::Iana(zone) => {
                 let at = Timestamp::from_second(unix).ok()?;
                 let next = zone
@@ -596,6 +752,136 @@ impl PgTimeZone {
         } else {
             after
         })
+    }
+}
+
+impl PgTimeZone {
+    /// `pg_get_timezone_offset`, the zone's one offset east of UTC when it never changes. A POSIX
+    /// specification in daylight saving time throughout has one too, but its rules need commas,
+    /// which no zone name inside a literal holds.
+    pub(crate) fn fixed_offset(&self) -> Option<i32> {
+        match &self.rules {
+            Rules::Fixed { offset, .. } => Some(*offset),
+            Rules::Posix { .. } | Rules::Iana(_) => None,
+        }
+    }
+
+    /// `pg_timezone_abbrev_is_known`, the meaning of the uppercased `abbreviation` among the
+    /// zone's own, and whether it has only that one.
+    pub(crate) fn abbreviation_is_known(
+        &self,
+        abbreviation: &str,
+    ) -> Option<(AbbreviationUse, bool)> {
+        let mut uses = Vec::new();
+        match &self.rules {
+            Rules::Fixed {
+                offset,
+                abbreviation: own,
+            } => {
+                if own == abbreviation {
+                    uses.push(AbbreviationUse {
+                        offset: *offset,
+                        dst: false,
+                    });
+                }
+            }
+            Rules::Posix {
+                rules,
+                std_name,
+                dst_name,
+            } => uses.extend(posix_use(rules, std_name, dst_name, abbreviation)),
+            Rules::Iana(zone) => {
+                let first = zone.to_offset_info(Timestamp::MIN);
+                if first.abbreviation() == abbreviation {
+                    uses.push(AbbreviationUse {
+                        offset: first.offset().seconds(),
+                        dst: first.dst().is_dst(),
+                    });
+                }
+                for change in zone
+                    .following(Timestamp::MIN)
+                    .take_while(|change| change.timestamp().as_second() <= ABBREVIATION_SCAN_END)
+                {
+                    if change.abbreviation() == abbreviation {
+                        uses.push(AbbreviationUse {
+                            offset: change.offset().seconds(),
+                            dst: change.dst().is_dst(),
+                        });
+                    }
+                }
+            }
+        }
+        let first = *uses.first()?;
+        Some((first, uses.iter().all(|other| *other == first)))
+    }
+
+    /// `pg_interpret_timezone_abbrev`, the meaning the uppercased `abbreviation` had in the zone
+    /// at `unix` seconds from 1970: the latest before it, else the one before every transition,
+    /// else the first after it.
+    ///
+    /// # Errors
+    ///
+    /// [`DateTimeError::OutsideJiffRange`] where an IANA zone is asked about an instant outside
+    /// jiff's years.
+    pub(crate) fn interpret_abbreviation(
+        &self,
+        abbreviation: &str,
+        unix: i64,
+    ) -> Result<Option<AbbreviationUse>, DateTimeError> {
+        let zone = match &self.rules {
+            Rules::Fixed { .. } | Rules::Posix { .. } => {
+                return Ok(self
+                    .abbreviation_is_known(abbreviation)
+                    .map(|(use_, _)| use_));
+            }
+            Rules::Iana(zone) => zone,
+        };
+        let at = Timestamp::from_second(unix).map_err(|_| DateTimeError::OutsideJiffRange)?;
+        let after = Timestamp::from_second(unix + 1).unwrap_or(Timestamp::MAX);
+        let matching = |abbreviation_used: &str, offset: jiff::tz::Offset, dst: jiff::tz::Dst| {
+            (abbreviation_used == abbreviation).then(|| AbbreviationUse {
+                offset: offset.seconds(),
+                dst: dst.is_dst(),
+            })
+        };
+        if let Some(found) = zone
+            .preceding(after)
+            .find_map(|change| matching(change.abbreviation(), change.offset(), change.dst()))
+        {
+            return Ok(Some(found));
+        }
+        let first = zone.to_offset_info(Timestamp::MIN);
+        if let Some(found) = matching(first.abbreviation(), first.offset(), first.dst()) {
+            return Ok(Some(found));
+        }
+        Ok(zone
+            .following(at)
+            .take_while(|change| change.timestamp().as_second() <= ABBREVIATION_SCAN_END)
+            .find_map(|change| matching(change.abbreviation(), change.offset(), change.dst())))
+    }
+}
+
+/// The meaning of `abbreviation` in a POSIX zone, whose `tzparse` types are the standard one,
+/// named first, and the daylight one, or the daylight one alone for a zone in daylight saving
+/// time throughout.
+fn posix_use(
+    rules: &Posix,
+    std_name: &str,
+    dst_name: &str,
+    abbreviation: &str,
+) -> Option<AbbreviationUse> {
+    if std_name == abbreviation {
+        rules.switches.then(|| AbbreviationUse {
+            offset: rules.offset(false),
+            dst: false,
+        })
+    } else if dst_name == abbreviation {
+        Some(AbbreviationUse {
+            offset: rules.offset(true),
+            dst: true,
+        })
+    } else {
+        None
     }
 }
 

@@ -342,7 +342,6 @@ fn declines_spellings_it_does_not_model() {
         "19990108",
         "J2451545",
         "2026-01-01 12:00 Europe/Rome",
-        "2026-01-01 12:00 CEST",
         "2026-01-01 12:00 PM",
         "999-01-01",
         "01000-01-01",
@@ -358,7 +357,6 @@ fn declines_spellings_it_does_not_model() {
         "2026-0101",
         "2026-01-011",
         "2026-01-01 12:000",
-        "2026-01-01 12:00 zulu",
     ] {
         assert_eq!(
             PgDate::parse(text, context).map(|_| ()),
@@ -384,6 +382,7 @@ fn declines_spellings_it_does_not_model() {
         "2026-01-01 12:00",
         "040506",
         "12:00:00.000000000000000000000000000000000000000000000000000000000",
+        "12:00 BC",
     ] {
         assert_eq!(
             PgTime::parse(text, context).map(|_| ()),
@@ -396,8 +395,21 @@ fn declines_spellings_it_does_not_model() {
             "{text}"
         );
     }
-    // A `timetz` without an offset takes the session's offset on the current date.
+    // A `timetz` without an offset, or with a zone whose offset changes, takes the offset of
+    // the current date.
     assert_eq!(PgTimeTz::parse("12:00", context).map(|_| ()), unsupported);
+    assert_eq!(
+        PgTimeTz::parse("12:00 Japan", context).map(|_| ()),
+        unsupported
+    );
+    assert_eq!(
+        PgTimeTz::parse("12:00 MSK", context).map(|_| ()),
+        unsupported
+    );
+    assert_eq!(
+        PgTimeTz::parse("12:00 Factory", context).map(|t| t.to_string()),
+        Ok("12:00:00+00".to_owned())
+    );
 }
 
 /// A `timestamptz` written without an offset needs the session's time zone.

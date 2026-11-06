@@ -10,8 +10,8 @@ mod postgres;
 use diesel::{dsl::sql, prelude::*, result::Error as DieselError, sql_types::Text};
 use sql_values::{
     DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimeZone, PgTimestamp, PgTimestampTz,
-    parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex, parse_time, parse_timestamp,
-    parse_timestamp_tz,
+    TimeZoneAbbreviations, parse_bool, parse_date, parse_f64, parse_i64, parse_pg_bytea_hex,
+    parse_time, parse_timestamp, parse_timestamp_tz,
 };
 
 /// One container per test binary, removed when the binary exits; a plain
@@ -111,6 +111,12 @@ const TIMES: &[&str] = &[
     "12:00Z",
     "12:00 z",
     "24:00:00+00",
+    "12:00 CEST",
+    "12:00:00EST",
+    "12:00 z",
+    "12:00 zulu",
+    "12:00 MSK",
+    "12:00 factory",
 ];
 
 #[test]
@@ -425,6 +431,96 @@ fn pg18_reads_every_time_zone_setting() {
         })
         .collect();
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Clocks at which the sets' abbreviations are read, on either side of Moscow's changes of 2011
+/// and 2014.
+const ABBREVIATION_CLOCKS: &[&str] = &["2010-07-15 12:00", "2012-01-15 12:00", "2026-01-15 12:00"];
+
+/// Every abbreviation of each bundled set, as PostgreSQL lists it, read at each clock.
+#[test]
+fn pg18_reads_every_abbreviation_of_each_set() {
+    let mut conn = pg18_conn();
+    let utc = PgTimeZone::parse("UTC").expect("UTC");
+    for name in ["Default", "Australia", "India"] {
+        let set = TimeZoneAbbreviations::bundled(name).expect("a bundled set");
+        // Raw SQL: `SET` and `pg_timezone_abbrevs_abbrevs` have no DSL form.
+        diesel::sql_query(format!("SET timezone_abbreviations = {}", quoted(name)))
+            .execute(&mut conn)
+            .expect("set the abbreviations");
+        let abbreviations: Vec<String> = diesel::select(sql::<diesel::sql_types::Array<Text>>(
+            "ARRAY(SELECT abbrev FROM pg_timezone_abbrevs_abbrevs())",
+        ))
+        .get_result(&mut conn)
+        .expect("list the abbreviations");
+        assert!(abbreviations.len() > 190, "{name}: {}", abbreviations.len());
+        let context = InputContext::new().with_time_zone_abbreviations(set);
+        let mut cases = Vec::new();
+        for abbreviation in &abbreviations {
+            for clock in ABBREVIATION_CLOCKS {
+                let literal = format!("{clock} {abbreviation}");
+                let got =
+                    PgTimestampTz::parse(&literal, context).and_then(|at| at.to_timestamp(&utc));
+                cases.push((
+                    format!("({}::timestamptz AT TIME ZONE 'UTC')", quoted(&literal)),
+                    worded(got),
+                ));
+            }
+        }
+        assert_answers(&mut conn, cases);
+    }
+}
+
+/// Abbreviations the session's zone uses, which PostgreSQL reads before the set's, and one
+/// neither knows.
+#[test]
+fn pg18_reads_abbreviations_of_the_session_zone() {
+    let mut conn = pg18_conn();
+    let utc = PgTimeZone::parse("UTC").expect("UTC");
+    let cases = [
+        ("Asia/Kolkata", "2026-01-15 12:00 IST"),
+        ("UTC", "2026-01-15 12:00 IST"),
+        ("UTC", "2026-01-15 12:00 UTC"),
+        ("GMT", "2026-01-15 12:00 GMT"),
+        ("EST5EDT,M3.2.0,M11.1.0", "2026-07-15 12:00 EST"),
+        ("Europe/Rome", "1880-01-01 12:00 RMT"),
+        ("Europe/Rome", "1850-01-01 12:00 LMT"),
+        ("Europe/Rome", "2026-01-15 12:00 CEST"),
+        ("Europe/Moscow", "2010-07-15 12:00 MSK"),
+        ("Europe/Moscow", "2012-01-15 12:00 MSK"),
+        ("Europe/Moscow", "2012-01-15 12:00 MSD"),
+        ("America/New_York", "2026-07-15 12:00 EST"),
+        ("America/New_York", "1880-01-01 12:00 LMT"),
+        ("EST5EDT,M3.2.0,M11.1.0", "2026-07-15 12:00 EDT"),
+        ("+02", "2026-07-15 12:00 CEST"),
+    ];
+    let mut checked = Vec::new();
+    for (name, literal) in cases {
+        let zone = PgTimeZone::parse(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        set_timezone(&mut conn, name);
+        let context = InputContext::new().with_time_zone(&zone);
+        let got = PgTimestampTz::parse(literal, context).and_then(|at| at.to_timestamp(&utc));
+        let expression = format!("({}::timestamptz AT TIME ZONE 'UTC')", quoted(literal));
+        checked.push((name, expression.clone(), worded(got)));
+    }
+    let mismatches: Vec<String> = checked
+        .into_iter()
+        .filter_map(|(name, expression, got)| {
+            set_timezone(&mut conn, name);
+            let expected = pg18_answer(&mut conn, &expression);
+            (got != expected)
+                .then(|| format!("{name} {expression}: crate {got:?}, PostgreSQL {expected:?}"))
+        })
+        .collect();
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    // An abbreviation nobody knows is refused, and the crate declines rather than guesses.
+    let context = InputContext::new().with_time_zone(&utc);
+    assert_eq!(
+        PgTimestampTz::parse("1880-01-01 12:00 RMT", context),
+        Err(DateTimeError::Unsupported)
+    );
+    set_timezone(&mut conn, "UTC");
+    assert!(pg18_answer(&mut conn, "'1880-01-01 12:00 RMT'::timestamptz").is_err());
 }
 
 // Raw SQL: vendor cast syntax cannot be expressed in the Diesel DSL.

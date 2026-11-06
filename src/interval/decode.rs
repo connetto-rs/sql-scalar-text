@@ -498,6 +498,12 @@ fn lookup(table: &[(&str, i32, i32)], key: &[u8]) -> Option<(i32, i32)> {
     })
 }
 
+/// `DecodeSpecial` for a date or time literal's word: `None` for one `datetktbl` lacks,
+/// `Some(Some(bc))` for `ad` or `bc`, and `Some(None)` for any of its other words.
+pub(crate) fn date_word_era(word: &[u8]) -> Option<Option<bool>> {
+    lookup(DATE_TOKENS, word).map(|(kind, value)| (kind == ADBC).then_some(value == 1))
+}
+
 /// `DecodeUnits` falling back to `DecodeSpecial`, answering the token type and value.
 fn decode_word(word: &[u8]) -> (i32, i32) {
     lookup(DELTA_TOKENS, word)
