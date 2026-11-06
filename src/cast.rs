@@ -84,6 +84,7 @@ impl CharLength {
 /// assert_eq!(error.to_string(), "invalid input syntax for type time");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PgType {
     /// `boolean`.
     Boolean,
@@ -200,6 +201,7 @@ pub enum CastValue {
 /// Why PostgreSQL refuses a cast, one variant per message it raises, or why this crate declines
 /// to answer for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
 pub enum CastError {
     /// Text the target's input function cannot read.
     #[error("invalid input syntax for type {}", .0.input_name())]

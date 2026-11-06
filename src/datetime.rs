@@ -36,6 +36,7 @@ const TZDISP_LIMIT: i32 = 16 * 3_600;
 /// Why PostgreSQL refuses a date or time, one variant per message it raises, or why this crate
 /// cannot answer for it without more session state or a wider zone database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
 pub enum DateTimeError {
     /// A year, month, day, hour, minute or second no calendar or clock has.
     #[error("date/time field value out of range")]
