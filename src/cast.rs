@@ -498,11 +498,12 @@ impl CastValue {
 /// The integer narrowings `int82`, `int84` and `int42`, or `int*_numeric` and the `numeric()`
 /// length coercion, of an integer to a target that [`CastTarget::takes_integer`].
 fn integer(value: i64, target: CastTarget) -> Result<CastValue, CastError> {
-    match IntegerType::try_from(target) {
-        Ok(integer) => integer.value(value),
-        Err(CastTarget::Numeric(typmod)) => numeric_typmod(PgNumeric::from(value), typmod),
-        Err(other) => unreachable!("{other:?} takes no integer"),
+    if let CastTarget::Numeric(typmod) = target {
+        return numeric_typmod(PgNumeric::from(value), typmod);
     }
+    IntegerType::try_from(target)
+        .expect("a target taking an integer is numeric or an integer type")
+        .value(value)
 }
 
 /// `timestamp_scale`, the timestamp rounded to the target's precision.

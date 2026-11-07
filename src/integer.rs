@@ -7,7 +7,7 @@ use crate::cast::{CastError, CastTarget, CastValue, PgType};
 /// A PostgreSQL integer type, ordered from the narrowest to the widest.
 ///
 /// ```
-/// use sql_values::{CastError, CastTarget, CastValue, IntegerType, PgType};
+/// use sql_values::{CastError, CastTarget, CastValue, IntegerType, PgType, cast_value};
 ///
 /// assert_eq!(IntegerType::Smallint.range(), -32_768..=32_767);
 /// assert_eq!(IntegerType::Smallint.wider(IntegerType::Integer), IntegerType::Integer);
@@ -18,6 +18,11 @@ use crate::cast::{CastError, CastTarget, CastValue, PgType};
 /// );
 /// assert_eq!(IntegerType::try_from(PgType::Bigint), Ok(IntegerType::Bigint));
 /// assert_eq!(IntegerType::try_from(CastTarget::Text), Err(CastTarget::Text));
+///
+/// // `value` is the cast from `bigint` to the type.
+/// for integer in [IntegerType::Smallint, IntegerType::Integer, IntegerType::Bigint] {
+///     assert_eq!(cast_value(CastValue::Bigint(7), integer.into()), integer.value(7));
+/// }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IntegerType {
