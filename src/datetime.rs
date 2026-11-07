@@ -11,6 +11,7 @@ pub(crate) mod tokens;
 
 use core::{cmp::Ordering, fmt};
 
+pub use arithmetic::DateArithmeticError;
 pub use decode::DateOrder;
 pub use input::{InputContext, parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 
@@ -54,12 +55,6 @@ pub enum DateTimeError {
     /// A timestamp before 4714-11-24 BC or from 294277-01-01.
     #[error("timestamp out of range")]
     TimestampOutOfRange,
-    /// A date from 294277-01-01 converted to `timestamp`.
-    #[error("date out of range for timestamp")]
-    DateOutOfRangeForTimestamp,
-    /// `date - date` with an infinite date.
-    #[error("cannot subtract infinite dates")]
-    CannotSubtractInfiniteDates,
     /// A value outside jiff's years -9999 to 9999, an infinity included, where jiff's types or
     /// its time zone database are needed.
     #[error("value outside jiff's years -9999 to 9999")]

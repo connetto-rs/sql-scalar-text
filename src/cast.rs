@@ -452,7 +452,10 @@ pub fn cast_value(value: CastValue, target: CastTarget) -> Result<CastValue, Cas
         }
         (CastValue::Date(date), CastTarget::Date) => Ok(CastValue::Date(date)),
         (CastValue::Date(date), CastTarget::Timestamp(precision)) => {
-            let at = date.to_timestamp().map_err(datetime_error)?;
+            // `date2timestamp` raises only this error.
+            let at = date
+                .to_timestamp()
+                .map_err(|_| CastError::DateOutOfRangeForTimestamp)?;
             Ok(timestamp(at, precision))
         }
         (CastValue::Timestamp(at), CastTarget::Date) => Ok(CastValue::Date(at.date())),
@@ -517,12 +520,14 @@ fn timestamp(at: PgTimestamp, precision: Option<u8>) -> CastValue {
     CastValue::Timestamp(PgTimestamp::from_stored(micros))
 }
 
-/// `numeric_in`, its refusal as the cast error.
+/// `numeric_in`, its refusal as the cast error. It raises only a syntax error or an overflow.
 fn numeric_input(text: &str) -> Result<PgNumeric, CastError> {
-    PgNumeric::parse(text).map_err(|error| match error {
-        NumericError::InvalidInputSyntax => CastError::InvalidInputSyntax(PgType::Numeric),
-        NumericError::FormatOverflow => CastError::NumericFormatOverflow,
-        NumericError::DivisionByZero => unreachable!("numeric_in never divides"),
+    PgNumeric::parse(text).map_err(|error| {
+        if error == NumericError::InvalidInputSyntax {
+            CastError::InvalidInputSyntax(PgType::Numeric)
+        } else {
+            CastError::NumericFormatOverflow
+        }
     })
 }
 
@@ -811,8 +816,7 @@ fn datetime_error(error: DateTimeError) -> CastError {
         DateTimeError::TimeZoneDisplacementOutOfRange => CastError::TimeZoneDisplacementOutOfRange,
         DateTimeError::DateOutOfRange => CastError::DateOutOfRange,
         DateTimeError::TimestampOutOfRange => CastError::TimestampOutOfRange,
-        DateTimeError::DateOutOfRangeForTimestamp => CastError::DateOutOfRangeForTimestamp,
-        DateTimeError::CannotSubtractInfiniteDates => unreachable!("no cast subtracts dates"),
+
         DateTimeError::InvalidInputSyntax(pg_type) => CastError::InvalidInputSyntax(pg_type),
         DateTimeError::OutsideJiffRange
         | DateTimeError::NeedsTimeZone
