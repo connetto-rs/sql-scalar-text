@@ -21,7 +21,7 @@ use diesel::{
 };
 use sql_values::{
     CastError, CastTarget, CastValue, CharLength, IntegerType, Literal, NumericTypmod, PgBpchar,
-    PgNumeric, PgType, cast_literal, cast_value, number_constant,
+    PgNumeric, PgType, PgValue, cast_literal, cast_value, number_constant,
 };
 
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
@@ -839,6 +839,174 @@ fn pg18_equates_every_bpchar_with_every_text() {
                     "{left_sql} = {right_sql}: crate {got}, PostgreSQL {expected}"
                 ));
             }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Values of every type [`PgValue`] holds, each as the literal and the type PostgreSQL reads it
+/// as, at the edges of each comparison.
+const COMPARED: &[(&str, &str)] = &[
+    ("f", "boolean"),
+    ("t", "boolean"),
+    ("-32768", "smallint"),
+    ("0", "smallint"),
+    ("4", "smallint"),
+    ("-2147483648", "integer"),
+    ("4", "integer"),
+    ("2147483647", "integer"),
+    ("-9223372036854775808", "bigint"),
+    ("4", "bigint"),
+    ("9223372036854775807", "bigint"),
+    ("4.00", "numeric"),
+    ("-4", "numeric"),
+    ("3.999", "numeric"),
+    ("4.0001", "numeric"),
+    ("-0.0", "numeric"),
+    ("2147483647.0", "numeric"),
+    ("9223372036854775808", "numeric"),
+    ("-9223372036854775808.000", "numeric"),
+    ("-9223372036854775809", "numeric"),
+    ("1e100", "numeric"),
+    ("NaN", "numeric"),
+    ("Infinity", "numeric"),
+    ("-Infinity", "numeric"),
+    ("", "text"),
+    ("B", "text"),
+    ("a", "text"),
+    ("ab", "text"),
+    ("a b", "text"),
+    ("é", "text"),
+    ("4", "text"),
+    ("t", "text"),
+    ("2026-01-01", "text"),
+    ("2026-01-01", "date"),
+    ("2025-12-31", "date"),
+    ("294276-12-31", "date"),
+    ("294277-01-01", "date"),
+    ("5874897-12-31", "date"),
+    ("4714-11-24 BC", "date"),
+    ("infinity", "date"),
+    ("-infinity", "date"),
+    ("2026-01-01 00:00", "timestamp"),
+    ("2025-12-31 23:59:59.999999", "timestamp"),
+    ("2026-01-01 00:00:00.000001", "timestamp"),
+    ("294276-12-31 23:59:59.999999", "timestamp"),
+    ("4714-11-24 00:00 BC", "timestamp"),
+    ("infinity", "timestamp"),
+    ("-infinity", "timestamp"),
+];
+
+/// The order PostgreSQL's `<` and `=` give `left` and `right`, or `None` when it has no operator
+/// between their types.
+fn pg_order(conn: &mut PgConnection, left: &str, right: &str) -> Option<Ordering> {
+    let expression =
+        format!("CASE WHEN {left} < {right} THEN -1 WHEN {left} = {right} THEN 0 ELSE 1 END");
+    match diesel::select(sql::<Integer>(&expression)).get_result::<i32>(conn) {
+        Ok(order) => Some(order.cmp(&0)),
+        Err(DieselError::DatabaseError(_, info))
+            if info.message().starts_with("operator does not exist") =>
+        {
+            None
+        }
+        Err(other) => panic!("{expression}: {other}"),
+    }
+}
+
+/// Every pair of values orders as PostgreSQL's `<` and `=` order it where PostgreSQL has an
+/// operator between their types, text under the `C` collation, and is unequal where it has none.
+/// Equal pairs hash equal.
+#[test]
+fn pg18_compares_every_value_pair() {
+    let all_targets = targets();
+    let values: Vec<(String, PgValue)> = COMPARED
+        .iter()
+        .map(|&(text, type_name)| {
+            let target = all_targets
+                .iter()
+                .find(|(name, _)| *name == type_name)
+                .map_or_else(|| panic!("{type_name}"), |&(_, target)| target);
+            let value = cast_literal(Literal::Quoted(text), target)
+                .unwrap_or_else(|error| panic!("{text:?}::{type_name}: {error}"));
+            let value =
+                PgValue::try_from(value).unwrap_or_else(|value| panic!("{value:?} is no PgValue"));
+            let collation = if type_name == "text" {
+                " COLLATE \"C\""
+            } else {
+                ""
+            };
+            (format!("{}::{type_name}{collation}", quoted(text)), value)
+        })
+        .collect();
+    let mut conn = connect();
+    let hasher = RandomState::new();
+    let mut mismatches = Vec::new();
+    for (left_sql, left) in &values {
+        for (right_sql, right) in &values {
+            let got = left.cmp(right);
+            match pg_order(&mut conn, left_sql, right_sql) {
+                Some(expected) if got != expected => mismatches.push(format!(
+                    "{left_sql} vs {right_sql}: crate {got:?}, PostgreSQL {expected:?}"
+                )),
+                None if got == Ordering::Equal => mismatches.push(format!(
+                    "{left_sql} vs {right_sql}: crate equal, PostgreSQL has no operator"
+                )),
+                _ => {}
+            }
+            if got == Ordering::Equal && hasher.hash_one(left) != hasher.hash_one(right) {
+                mismatches.push(format!(
+                    "{left_sql} and {right_sql} are equal but hash apart"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Every value prints as PostgreSQL's output function prints it, converts back to the
+/// [`CastValue`] it came from at its type's width, and is the value each of its accessors gives.
+#[test]
+fn pg18_prints_and_converts_every_value() {
+    let all_targets = targets();
+    let target = |type_name: &str| {
+        all_targets
+            .iter()
+            .find(|(name, _)| *name == type_name)
+            .map_or_else(|| panic!("{type_name}"), |&(_, target)| target)
+    };
+    let mut conn = connect();
+    let mut mismatches = Vec::new();
+    for &(text, type_name) in COMPARED {
+        let target = target(type_name);
+        let cast = cast_literal(Literal::Quoted(text), target)
+            .unwrap_or_else(|error| panic!("{text:?}::{type_name}: {error}"));
+        let value = PgValue::try_from(cast.clone())
+            .unwrap_or_else(|value| panic!("{value:?} is no PgValue"));
+        let sql = format!("{}::{type_name}", quoted(text));
+        let expected = pg_text(&mut conn, &sql);
+        if Ok(value.to_string()) != expected {
+            mismatches.push(format!("{sql}: crate {value}, PostgreSQL {expected:?}"));
+        }
+        let accessed = [
+            value.as_numeric().map(PgValue::Numeric),
+            value.as_text().map(|text| PgValue::Text(text.into())),
+            value.as_date().map(PgValue::Date),
+            value.as_timestamp().map(PgValue::Timestamp),
+        ];
+        if accessed.iter().flatten().any(|accessed| *accessed != value) {
+            mismatches.push(format!("{sql}: an accessor gives another value"));
+        }
+        let width = IntegerType::try_from(target).unwrap_or(IntegerType::Bigint);
+        if value.into_cast_value(width) != Ok(cast) {
+            mismatches.push(format!("{sql}: the cast value does not come back"));
+        }
+    }
+    for (text, type_name) in [("ab", "char(4)"), ("2026-01-01 00:00+00", "timestamptz")] {
+        let cast = cast_literal(Literal::Quoted(text), target(type_name))
+            .unwrap_or_else(|error| panic!("{text:?}::{type_name}: {error}"));
+        match PgValue::try_from(cast.clone()) {
+            Err(refused) if refused == cast => {}
+            other => mismatches.push(format!("{text:?}::{type_name} gave {other:?}")),
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));

@@ -10,6 +10,7 @@ mod float;
 mod integer;
 mod interval;
 mod numeric;
+mod value;
 mod zone;
 
 pub use bpchar::PgBpchar;
@@ -27,6 +28,7 @@ pub use interval::{
     parse_interval, parse_interval_typmod,
 };
 pub use numeric::{NumericError, NumericTypmod, PgNumeric};
+pub use value::PgValue;
 pub use zone::{PgTimeZone, TimeZoneAbbreviations, TimeZoneAbbreviationsError, TimeZoneError};
 
 use alloc::vec::Vec;
