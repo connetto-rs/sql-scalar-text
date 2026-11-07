@@ -705,9 +705,6 @@ fn datetime_error(error: DateTimeError) -> CastError {
         DateTimeError::TimeZoneDisplacementOutOfRange => CastError::TimeZoneDisplacementOutOfRange,
         DateTimeError::DateOutOfRange => CastError::DateOutOfRange,
         DateTimeError::TimestampOutOfRange => CastError::TimestampOutOfRange,
-        DateTimeError::DateOutOfRangeForTimestamp | DateTimeError::CannotSubtractInfiniteDates => {
-            unreachable!("no cast of a literal converts or subtracts dates")
-        }
         DateTimeError::InvalidInputSyntax(pg_type) => CastError::InvalidInputSyntax(pg_type),
         DateTimeError::OutsideJiffRange
         | DateTimeError::NeedsTimeZone
