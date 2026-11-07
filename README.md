@@ -7,7 +7,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/connetto-rs/sql-values)
 [![license](https://img.shields.io/crates/l/sql-values.svg)](https://github.com/connetto-rs/sql-values/blob/main/LICENSE)
 
-`sql-values` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order, `numeric`, `date` and `interval` arithmetic, and the explicit cast of a literal or a value), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value. Dates and times are held as PostgreSQL stores them, over its whole range, and `timestamptz` arithmetic runs in a named time zone from jiff's bundled IANA database.
+`sql-values` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order, also between values of different types, `numeric`, `date` and `interval` arithmetic, and the explicit cast of a literal or a value), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value. Dates and times are held as PostgreSQL stores them, over its whole range, and `timestamptz` arithmetic runs in a named time zone from jiff's bundled IANA database.
 
 ```rust
 use sql_values::{

@@ -279,6 +279,114 @@ impl PgNumeric {
             Repr::NaN => 3,
         }
     }
+
+    /// What `cmp_numerics` orders the value by.
+    fn key(&self) -> Key<'_> {
+        match &self.0 {
+            Repr::Finite(finite) => Key {
+                class: self.class(),
+                weight: finite.weight,
+                digits: &finite.digits,
+            },
+            _ => Key {
+                class: self.class(),
+                weight: 0,
+                digits: &[],
+            },
+        }
+    }
+
+    /// The order of the value against the `numeric` of an integer, without making it.
+    pub(crate) fn cmp_integer(&self, value: i64) -> Ordering {
+        self.key().order(&IntegerDigits::new(value).key())
+    }
+
+    /// Feeds `state` what the `numeric` of an integer feeds it, without making it.
+    pub(crate) fn hash_integer<H: Hasher>(value: i64, state: &mut H) {
+        IntegerDigits::new(value).key().hash(state);
+    }
+}
+
+/// What `cmp_numerics` orders a value by, its order class and, for a nonzero finite value, the
+/// weight and digits of its magnitude.
+#[derive(Hash)]
+struct Key<'a> {
+    class: i8,
+    weight: i64,
+    digits: &'a [u8],
+}
+
+impl Key<'_> {
+    /// The class first, then the magnitude, reversed for a negative value.
+    fn order(&self, other: &Key<'_>) -> Ordering {
+        self.class.cmp(&other.class).then_with(|| {
+            let magnitude = self
+                .weight
+                .cmp(&other.weight)
+                .then_with(|| self.digits.cmp(other.digits));
+            if self.class < 0 {
+                magnitude.reverse()
+            } else {
+                magnitude
+            }
+        })
+    }
+}
+
+/// The decimal digits of an `i64` as `int64_to_numeric` makes them, normalised as [`Finite`]
+/// holds them, without allocating.
+struct IntegerDigits {
+    negative: bool,
+    /// The digits, the first `len` of them significant.
+    digits: [u8; 19],
+    len: usize,
+    weight: i64,
+}
+
+impl IntegerDigits {
+    fn new(value: i64) -> Self {
+        let mut digits = [0; 19];
+        let mut count = 0;
+        let mut rest = value.unsigned_abs();
+        while rest > 0 {
+            digits[count] = u8::try_from(rest % 10).expect("a decimal digit fits u8");
+            rest /= 10;
+            count += 1;
+        }
+        digits[..count].reverse();
+        let len = digits[..count]
+            .iter()
+            .rposition(|&digit| digit != 0)
+            .map_or(0, |last| last + 1);
+        let weight = if len == 0 {
+            0
+        } else {
+            i64::try_from(count).expect("an i64 has 19 digits") - 1
+        };
+        Self {
+            negative: value < 0,
+            digits,
+            len,
+            weight,
+        }
+    }
+
+    fn digits(&self) -> &[u8] {
+        &self.digits[..self.len]
+    }
+
+    fn key(&self) -> Key<'_> {
+        let class = match (self.len, self.negative) {
+            (0, _) => 0,
+            (_, true) => -1,
+            (_, false) => 1,
+        };
+        Key {
+            class,
+            weight: self.weight,
+            digits: self.digits(),
+        }
+    }
 }
 
 impl Finite {
@@ -350,22 +458,13 @@ impl Finite {
 
     /// `int64_to_numeric`.
     fn from_i64(value: i64) -> Self {
-        let mut digits = Vec::new();
-        let mut rest = value.unsigned_abs();
-        while rest > 0 {
-            digits.push(u8::try_from(rest % 10).expect("a decimal digit fits u8"));
-            rest /= 10;
-        }
-        digits.reverse();
-        let weight = i64::try_from(digits.len()).expect("an i64 has 19 digits") - 1;
-        let mut finite = Self {
-            negative: value < 0,
-            digits,
-            weight,
+        let integer = IntegerDigits::new(value);
+        Self {
+            negative: integer.negative,
+            digits: integer.digits().to_vec(),
+            weight: integer.weight,
             dscale: 0,
-        };
-        finite.normalise();
-        finite
+        }
     }
 
     /// The power of ten of the last digit, `1` for zero.
@@ -413,13 +512,6 @@ impl Finite {
         } else {
             Err(NumericError::FormatOverflow)
         }
-    }
-
-    /// The magnitude order of two values of the same sign.
-    fn cmp_magnitude(&self, other: &Self) -> Ordering {
-        self.weight
-            .cmp(&other.weight)
-            .then_with(|| self.digits.cmp(&other.digits))
     }
 }
 
@@ -619,31 +711,13 @@ impl PartialOrd for PgNumeric {
 /// `cmp_numerics`, ordering `-Infinity` below finite values by value, then `Infinity`, then `NaN`.
 impl Ord for PgNumeric {
     fn cmp(&self, other: &Self) -> Ordering {
-        match (&self.0, &other.0) {
-            (Repr::Finite(left), Repr::Finite(right))
-                if left.negative == right.negative
-                    && !left.digits.is_empty()
-                    && !right.digits.is_empty() =>
-            {
-                let magnitude = left.cmp_magnitude(right);
-                if left.negative {
-                    magnitude.reverse()
-                } else {
-                    magnitude
-                }
-            }
-            _ => self.class().cmp(&other.class()),
-        }
+        self.key().order(&other.key())
     }
 }
 
 impl Hash for PgNumeric {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.class().hash(state);
-        if let Repr::Finite(finite) = &self.0 {
-            finite.weight.hash(state);
-            finite.digits.hash(state);
-        }
+        self.key().hash(state);
     }
 }
 
