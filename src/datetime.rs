@@ -2,6 +2,7 @@
 //! stores them, printed by their output functions under `DateStyle` `ISO`, and converted into one
 //! another in a [`PgTimeZone`].
 
+mod arithmetic;
 mod decode;
 mod input;
 #[cfg(feature = "jiff")]
@@ -10,6 +11,7 @@ pub(crate) mod tokens;
 
 use core::{cmp::Ordering, fmt};
 
+pub use arithmetic::DateArithmeticError;
 pub use decode::DateOrder;
 pub use input::{InputContext, parse_date, parse_time, parse_timestamp, parse_timestamp_tz};
 
@@ -26,6 +28,9 @@ pub(crate) const POSTGRES_EPOCH_JDATE: i32 = 2_451_545;
 const UNIX_TO_POSTGRES_SECS: i64 = 946_684_800;
 /// `DATE_END_JULIAN`, the Julian day of 5874898-01-01, past the last date.
 const DATE_END_JULIAN: i32 = 2_147_483_494;
+/// `TIMESTAMP_END_JULIAN - POSTGRES_EPOCH_JDATE`, the days from 2000-01-01 to 294277-01-01, the
+/// first date past the last timestamp.
+const TIMESTAMP_END_DAYS: i32 = 106_751_983;
 /// `MIN_TIMESTAMP`, 4714-11-24 00:00:00 BC.
 pub(crate) const MIN_TIMESTAMP: i64 = -211_813_488_000_000_000;
 /// `END_TIMESTAMP`, 294277-01-01 00:00:00, past the last timestamp.
@@ -194,8 +199,7 @@ impl PgDate {
     /// are the infinities, or `None` outside PostgreSQL's dates.
     #[must_use]
     pub const fn from_pg_days(days: i32) -> Option<Self> {
-        let valid = -POSTGRES_EPOCH_JDATE <= days && days < DATE_END_JULIAN - POSTGRES_EPOCH_JDATE;
-        if valid || days == i32::MAX || days == i32::MIN {
+        if is_valid_date(days) || days == i32::MAX || days == i32::MIN {
             Some(Self(days))
         } else {
             None
@@ -564,6 +568,11 @@ pub(crate) fn abbreviation_offset(
 /// `IS_VALID_TIMESTAMP`.
 pub(crate) const fn is_valid_timestamp(micros: i64) -> bool {
     MIN_TIMESTAMP <= micros && micros < END_TIMESTAMP
+}
+
+/// `IS_VALID_DATE`.
+const fn is_valid_date(days: i32) -> bool {
+    -POSTGRES_EPOCH_JDATE <= days && days < DATE_END_JULIAN - POSTGRES_EPOCH_JDATE
 }
 
 /// `IS_VALID_JULIAN`, which checks the lower bound only to the month.
