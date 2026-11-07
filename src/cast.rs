@@ -1,5 +1,6 @@
-//! PostgreSQL 18's explicit cast of a literal, `'…'::type` or `1.5::type`, as the input function
-//! or the cast from the constant's type followed by the length coercion of the target's modifier.
+//! PostgreSQL 18's explicit casts, of a literal, `'…'::type` or `1.5::type`, and of a typed
+//! value, each the input function or the cast function `pg_cast` names followed by the length
+//! coercion of the target's modifier, and the typing of a numeric constant.
 
 use alloc::string::{String, ToString};
 use core::fmt;
@@ -21,7 +22,7 @@ pub enum Literal<'a> {
     Number(&'a str),
 }
 
-/// The type a literal is cast to, with its modifier.
+/// The type a literal or value is cast to, with its modifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CastTarget {
     /// `boolean`.
@@ -171,8 +172,8 @@ impl CastTarget {
     }
 }
 
-/// The value a cast produces, printed by [`Display`](fmt::Display) as the type's output function
-/// prints it under the default `DateStyle` of `ISO`.
+/// The value a cast produces or takes, printed by [`Display`](fmt::Display) as the type's output
+/// function prints it under the default `DateStyle` of `ISO`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CastValue {
     /// A `boolean`, printed `t` or `f`.
@@ -209,9 +210,15 @@ pub enum CastError {
     /// Text the integer input function reads as a number beyond the type.
     #[error("value is out of range for type {0}")]
     ValueOutOfRange(PgType),
-    /// A constant the cast to an integer type finds beyond the type.
+    /// A value the cast to an integer type finds beyond the type.
     #[error("{0} out of range")]
     OutOfRange(PgType),
+    /// A `NaN` cast to an integer type.
+    #[error("cannot convert NaN to {0}")]
+    CannotConvertNaN(PgType),
+    /// An infinite `numeric` cast to an integer type.
+    #[error("cannot convert infinity to {0}")]
+    CannotConvertInfinity(PgType),
     /// A value beyond the precision of `numeric(p, s)` after rounding to its scale, or an
     /// infinity cast to it.
     #[error("numeric field overflow")]
@@ -228,20 +235,25 @@ pub enum CastError {
     /// A timestamp before 4714-11-24 BC.
     #[error("timestamp out of range")]
     TimestampOutOfRange,
+    /// A date from 294277-01-01 cast to `timestamp`.
+    #[error("date out of range for timestamp")]
+    DateOutOfRangeForTimestamp,
     /// An offset of 16 hours or more, or with minutes or seconds of 60 or more.
     #[error("time zone displacement out of range")]
     TimeZoneDisplacementOutOfRange,
-    /// A numeric constant of a type with no cast to the target.
+    /// A value of a type with no cast to the target.
     #[error("cannot cast type {from} to {to}")]
     CannotCast {
-        /// The constant's type.
+        /// The value's type.
         from: PgType,
         /// The target's type.
         to: PgType,
     },
     /// A literal or cast this crate does not model. A date or timestamp is read only in the
     /// spellings [`PgDate::parse`] and [`PgTimestamp::parse`] read, and a `timestamptz` only
-    /// with its offset, since without one the session's `TimeZone` decides the instant.
+    /// with its offset, since without one the session's `TimeZone` decides the instant. For the
+    /// same reason no cast between `timestamptz` and `date`, `timestamp` or a character type is
+    /// modelled.
     #[error("cast not modelled")]
     Unsupported,
 }
@@ -308,52 +320,215 @@ pub enum CastError {
 pub fn cast_literal(literal: Literal<'_>, target: CastTarget) -> Result<CastValue, CastError> {
     match literal {
         Literal::Quoted(text) => cast_quoted(text, target),
-        Literal::Number(text) => cast_constant(Constant::read(text)?, target),
+        Literal::Number(text) => cast_value(number_constant(text)?, target),
     }
 }
 
-/// A numeric constant as `make_const` types it.
-enum Constant {
-    Integer(i32),
-    Bigint(i64),
-    Numeric(PgNumeric),
-}
-
-impl Constant {
-    /// The constant PostgreSQL's lexer and `make_const` make of `text`.
-    fn read(text: &str) -> Result<Self, CastError> {
-        let unsigned = text.strip_prefix('-').unwrap_or(text);
-        match scan_number(unsigned.as_bytes()) {
-            None => Err(CastError::Unsupported),
-            Some(NumberToken::Integer) => {
-                if let Ok(value) = int_in(text, 32) {
-                    Ok(Self::Integer(narrow(value)))
-                } else if let Ok(value) = int_in(text, 64) {
-                    Ok(Self::Bigint(value))
-                } else {
-                    numeric_input(text).map(Self::Numeric)
-                }
+/// The value PostgreSQL 18 makes of a numeric constant, written as [`Literal::Number`] takes it,
+/// as its lexer and `make_const` type it. An integer is an `integer` when it fits, else a
+/// `bigint` when it fits, else a `numeric`, and a constant with a point or an exponent is a
+/// `numeric`.
+///
+/// # Errors
+///
+/// [`CastError::Unsupported`] for text that is not one numeric constant, and the error
+/// `numeric_in` raises for a `numeric` PostgreSQL cannot store.
+///
+/// ```
+/// use sql_values::{CastValue, number_constant};
+///
+/// assert_eq!(number_constant("2147483647"), Ok(CastValue::Integer(i32::MAX)));
+/// assert_eq!(number_constant("2147483648"), Ok(CastValue::Bigint(2_147_483_648)));
+/// assert_eq!(number_constant("-0x8000_0000"), Ok(CastValue::Integer(i32::MIN)));
+/// let big = number_constant("9223372036854775808").unwrap();
+/// assert!(matches!(big, CastValue::Numeric(_)));
+/// assert_eq!(number_constant("1.50").unwrap().to_string(), "1.50");
+/// ```
+pub fn number_constant(text: &str) -> Result<CastValue, CastError> {
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    match scan_number(unsigned.as_bytes()) {
+        None => Err(CastError::Unsupported),
+        Some(NumberToken::Integer) => {
+            if let Ok(value) = int_in(text, 32) {
+                Ok(CastValue::Integer(narrow(value)))
+            } else if let Ok(value) = int_in(text, 64) {
+                Ok(CastValue::Bigint(value))
+            } else {
+                numeric_input(text).map(CastValue::Numeric)
             }
-            Some(NumberToken::Decimal) => numeric_input(text).map(Self::Numeric),
         }
+        Some(NumberToken::Decimal) => numeric_input(text).map(CastValue::Numeric),
     }
+}
 
+/// The value PostgreSQL 18's explicit cast `value::target` produces, or the error it raises.
+///
+/// A value of a character type is read by the target's input function, as `pg_cast`'s I/O
+/// coercion does, and a value cast to a character type is printed by its type's output function,
+/// `boolean` as `true` or `false`. Between the other types the cast is the function `pg_cast`
+/// names, `int4_bool`, `bool_int4`, the integer narrowings, `int*_numeric`, `numeric_int*`,
+/// `date_timestamp` and `timestamp_date`. The length coercion of the target's modifier follows,
+/// and a pair `pg_cast` has no cast for raises [`CastError::CannotCast`].
+///
+/// # Errors
+///
+/// The [`CastError`] PostgreSQL raises, or [`CastError::Unsupported`] for a cast whose answer
+/// the session's `TimeZone` decides, or a text the target's input function is not modelled for.
+///
+/// ```
+/// use sql_values::{CastError, CastTarget, CastValue, PgNumeric, PgType, cast_value};
+///
+/// let cast = |value, target| cast_value(value, target).map(|value| value.to_string());
+///
+/// assert_eq!(cast(CastValue::Integer(1), CastTarget::Boolean).unwrap(), "t");
+/// assert_eq!(
+///     cast(CastValue::Bigint(1), CastTarget::Boolean),
+///     Err(CastError::CannotCast { from: PgType::Bigint, to: PgType::Boolean }),
+/// );
+/// assert_eq!(cast(CastValue::Boolean(true), CastTarget::Text).unwrap(), "true");
+/// let half = PgNumeric::parse("-2.5").unwrap();
+/// assert_eq!(cast(CastValue::Numeric(half), CastTarget::Smallint).unwrap(), "-3");
+/// assert_eq!(
+///     cast(CastValue::Numeric(PgNumeric::NAN), CastTarget::Integer),
+///     Err(CastError::CannotConvertNaN(PgType::Integer)),
+/// );
+/// assert_eq!(
+///     cast(CastValue::Integer(40_000), CastTarget::Smallint),
+///     Err(CastError::OutOfRange(PgType::Smallint)),
+/// );
+/// assert_eq!(
+///     cast(CastValue::Text("x".into()), CastTarget::Boolean),
+///     Err(CastError::InvalidInputSyntax(PgType::Boolean)),
+/// );
+/// ```
+pub fn cast_value(value: CastValue, target: CastTarget) -> Result<CastValue, CastError> {
+    let cannot_cast = CastError::CannotCast {
+        from: value.pg_type(),
+        to: target.pg_type(),
+    };
+    match (value, target) {
+        (CastValue::Text(text), _) => cast_quoted(&text, target),
+        // `rtrim1`, dropping the blanks `char(n)` pads with.
+        (CastValue::Bpchar(text), CastTarget::Text | CastTarget::Varchar(_)) => {
+            Ok(character(text.trim_end_matches(' '), target))
+        }
+        (CastValue::Bpchar(text), _) => cast_quoted(&text, target),
+        (
+            CastValue::TimestampTz(_),
+            CastTarget::Date
+            | CastTarget::Timestamp(_)
+            | CastTarget::Text
+            | CastTarget::Varchar(_)
+            | CastTarget::Bpchar(_),
+        )
+        | (CastValue::Date(_) | CastValue::Timestamp(_), CastTarget::TimestampTz(_)) => {
+            Err(CastError::Unsupported)
+        }
+        // `booltext`.
+        (
+            CastValue::Boolean(value),
+            CastTarget::Text | CastTarget::Varchar(_) | CastTarget::Bpchar(_),
+        ) => Ok(character(if value { "true" } else { "false" }, target)),
+        (value, CastTarget::Text | CastTarget::Varchar(_) | CastTarget::Bpchar(_)) => {
+            Ok(character(&value.to_string(), target))
+        }
+        (CastValue::Boolean(value), CastTarget::Boolean) => Ok(CastValue::Boolean(value)),
+        (CastValue::Boolean(value), CastTarget::Integer) => Ok(CastValue::Integer(value.into())),
+        (CastValue::Integer(value), CastTarget::Boolean) => Ok(CastValue::Boolean(value != 0)),
+        (CastValue::Smallint(value), _) if target.takes_integer() => integer(value.into(), target),
+        (CastValue::Integer(value), _) if target.takes_integer() => integer(value.into(), target),
+        (CastValue::Bigint(value), _) if target.takes_integer() => integer(value, target),
+        (CastValue::Numeric(value), CastTarget::Numeric(typmod)) => numeric_typmod(value, typmod),
+        (CastValue::Numeric(value), _) if target.takes_integer() => {
+            let to = target.pg_type();
+            if value.is_nan() {
+                Err(CastError::CannotConvertNaN(to))
+            } else if value.is_infinite() {
+                Err(CastError::CannotConvertInfinity(to))
+            } else {
+                let value = value.into_i64_rounded().ok_or(CastError::OutOfRange(to))?;
+                integer(value, target)
+            }
+        }
+        (CastValue::Date(date), CastTarget::Date) => Ok(CastValue::Date(date)),
+        (CastValue::Date(date), CastTarget::Timestamp(precision)) => {
+            // `date2timestamp` raises only this error.
+            let at = date
+                .to_timestamp()
+                .map_err(|_| CastError::DateOutOfRangeForTimestamp)?;
+            Ok(timestamp(at, precision))
+        }
+        (CastValue::Timestamp(at), CastTarget::Date) => Ok(CastValue::Date(at.date())),
+        (CastValue::Timestamp(at), CastTarget::Timestamp(precision)) => {
+            Ok(timestamp(at, precision))
+        }
+        (CastValue::TimestampTz(at), CastTarget::TimestampTz(precision)) => {
+            let micros = adjust_timestamp_for_typmod(at.pg_micros(), precision);
+            Ok(CastValue::TimestampTz(PgTimestampTz::from_stored(micros)))
+        }
+        _ => Err(cannot_cast),
+    }
+}
+
+impl CastTarget {
+    /// Whether the target is an integer type or `numeric`, which every integer type casts to.
+    const fn takes_integer(self) -> bool {
+        matches!(
+            self,
+            Self::Smallint | Self::Integer | Self::Bigint | Self::Numeric(_)
+        )
+    }
+}
+
+impl CastValue {
+    /// The value's type, `text` for a `varchar`.
     const fn pg_type(&self) -> PgType {
         match self {
+            Self::Boolean(_) => PgType::Boolean,
+            Self::Smallint(_) => PgType::Smallint,
             Self::Integer(_) => PgType::Integer,
             Self::Bigint(_) => PgType::Bigint,
             Self::Numeric(_) => PgType::Numeric,
+            Self::Text(_) => PgType::Text,
+            Self::Bpchar(_) => PgType::Bpchar,
+            Self::Date(_) => PgType::Date,
+            Self::Timestamp(_) => PgType::Timestamp,
+            Self::TimestampTz(_) => PgType::TimestampTz,
         }
     }
+}
 
-    /// The constant as an `i64`, `numeric` rounded half away from zero, or `None` beyond it.
-    fn into_i64(self) -> Option<i64> {
-        match self {
-            Self::Integer(value) => Some(i64::from(value)),
-            Self::Bigint(value) => Some(value),
-            Self::Numeric(value) => value.into_i64_rounded(),
-        }
+/// The integer narrowings `int82`, `int84` and `int42`, or `int*_numeric` and the `numeric()`
+/// length coercion, of an integer to a target that [`CastTarget::takes_integer`].
+fn integer(value: i64, target: CastTarget) -> Result<CastValue, CastError> {
+    let out_of_range = CastError::OutOfRange(target.pg_type());
+    match target {
+        CastTarget::Smallint => i16::try_from(value)
+            .map(CastValue::Smallint)
+            .map_err(|_| out_of_range),
+        CastTarget::Integer => i32::try_from(value)
+            .map(CastValue::Integer)
+            .map_err(|_| out_of_range),
+        CastTarget::Numeric(typmod) => numeric_typmod(PgNumeric::from(value), typmod),
+        _ => Ok(CastValue::Bigint(value)),
     }
+}
+
+/// `timestamp_scale`, the timestamp rounded to the target's precision.
+fn timestamp(at: PgTimestamp, precision: Option<u8>) -> CastValue {
+    let micros = adjust_timestamp_for_typmod(at.pg_micros(), precision);
+    CastValue::Timestamp(PgTimestamp::from_stored(micros))
+}
+
+/// `numeric_in`, its refusal as the cast error. It raises only a syntax error or an overflow.
+fn numeric_input(text: &str) -> Result<PgNumeric, CastError> {
+    PgNumeric::parse(text).map_err(|error| {
+        if error == NumericError::InvalidInputSyntax {
+            CastError::InvalidInputSyntax(PgType::Numeric)
+        } else {
+            CastError::NumericFormatOverflow
+        }
+    })
 }
 
 /// The lexer's token for a numeric constant.
@@ -432,59 +607,6 @@ fn scan_decinteger(bytes: &[u8]) -> usize {
     }
 }
 
-/// The cast of a numeric constant by `int4_bool`, the integer narrowings, `numeric_int*`, the
-/// `numeric()` length coercion, or the output function for a character type.
-fn cast_constant(constant: Constant, target: CastTarget) -> Result<CastValue, CastError> {
-    let from = constant.pg_type();
-    match target {
-        CastTarget::Boolean => match constant {
-            Constant::Integer(value) => Ok(CastValue::Boolean(value != 0)),
-            _ => Err(CastError::CannotCast {
-                from,
-                to: PgType::Boolean,
-            }),
-        },
-        CastTarget::Smallint => {
-            let value = constant.into_i64().and_then(|v| i16::try_from(v).ok());
-            value
-                .map(CastValue::Smallint)
-                .ok_or(CastError::OutOfRange(PgType::Smallint))
-        }
-        CastTarget::Integer => {
-            let value = constant.into_i64().and_then(|v| i32::try_from(v).ok());
-            value
-                .map(CastValue::Integer)
-                .ok_or(CastError::OutOfRange(PgType::Integer))
-        }
-        CastTarget::Bigint => constant
-            .into_i64()
-            .map(CastValue::Bigint)
-            .ok_or(CastError::OutOfRange(PgType::Bigint)),
-        CastTarget::Numeric(typmod) => {
-            let value = match constant {
-                Constant::Integer(value) => PgNumeric::from(value),
-                Constant::Bigint(value) => PgNumeric::from(value),
-                Constant::Numeric(value) => value,
-            };
-            numeric_typmod(value, typmod)
-        }
-        CastTarget::Text | CastTarget::Varchar(_) | CastTarget::Bpchar(_) => {
-            let text = match constant {
-                Constant::Integer(value) => value.to_string(),
-                Constant::Bigint(value) => value.to_string(),
-                Constant::Numeric(value) => value.to_string(),
-            };
-            Ok(character(&text, target))
-        }
-        CastTarget::Date | CastTarget::Timestamp(_) | CastTarget::TimestampTz(_) => {
-            Err(CastError::CannotCast {
-                from,
-                to: target.pg_type(),
-            })
-        }
-    }
-}
-
 /// The cast of an unknown literal, the target's input function without a modifier followed by
 /// the length coercion.
 fn cast_quoted(text: &str, target: CastTarget) -> Result<CastValue, CastError> {
@@ -532,17 +654,6 @@ fn numeric_typmod(value: PgNumeric, typmod: Option<NumericTypmod>) -> Result<Cas
         None => Ok(value),
     }
     .map(CastValue::Numeric)
-}
-
-/// `numeric_in`, its refusal as the cast error. It raises only a syntax error or an overflow.
-fn numeric_input(text: &str) -> Result<PgNumeric, CastError> {
-    PgNumeric::parse(text).map_err(|error| {
-        if error == NumericError::InvalidInputSyntax {
-            CastError::InvalidInputSyntax(PgType::Numeric)
-        } else {
-            CastError::NumericFormatOverflow
-        }
-    })
 }
 
 /// The `varchar()` or `bpchar()` length coercion of an explicit cast, which truncates to the
@@ -705,6 +816,7 @@ fn datetime_error(error: DateTimeError) -> CastError {
         DateTimeError::TimeZoneDisplacementOutOfRange => CastError::TimeZoneDisplacementOutOfRange,
         DateTimeError::DateOutOfRange => CastError::DateOutOfRange,
         DateTimeError::TimestampOutOfRange => CastError::TimestampOutOfRange,
+
         DateTimeError::InvalidInputSyntax(pg_type) => CastError::InvalidInputSyntax(pg_type),
         DateTimeError::OutsideJiffRange
         | DateTimeError::NeedsTimeZone

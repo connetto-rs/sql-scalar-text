@@ -10,7 +10,10 @@ mod interval;
 mod numeric;
 mod zone;
 
-pub use cast::{CastError, CastTarget, CastValue, CharLength, Literal, PgType, cast_literal};
+pub use cast::{
+    CastError, CastTarget, CastValue, CharLength, Literal, PgType, cast_literal, cast_value,
+    number_constant,
+};
 pub use datetime::{
     DateArithmeticError, DateOrder, DateTimeError, InputContext, PgDate, PgTime, PgTimeTz,
     PgTimestamp, PgTimestampTz, parse_date, parse_time, parse_timestamp, parse_timestamp_tz,
