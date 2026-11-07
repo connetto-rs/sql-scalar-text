@@ -7,6 +7,7 @@ mod bpchar;
 mod cast;
 mod datetime;
 mod float;
+mod integer;
 mod interval;
 mod numeric;
 mod zone;
@@ -20,6 +21,7 @@ pub use datetime::{
     DateArithmeticError, DateOrder, DateTimeError, InputContext, PgDate, PgTime, PgTimeTz,
     PgTimestamp, PgTimestampTz, parse_date, parse_time, parse_timestamp, parse_timestamp_tz,
 };
+pub use integer::IntegerType;
 pub use interval::{
     IntervalError, IntervalFields, IntervalSum, IntervalTypmod, PgInterval, ShiftError,
     parse_interval, parse_interval_typmod,

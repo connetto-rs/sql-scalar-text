@@ -20,8 +20,8 @@ use diesel::{
     sql_types::{Bool, Integer, Text},
 };
 use sql_values::{
-    CastError, CastTarget, CastValue, CharLength, Literal, NumericTypmod, PgBpchar, PgNumeric,
-    PgType, cast_literal, cast_value, number_constant,
+    CastError, CastTarget, CastValue, CharLength, IntegerType, Literal, NumericTypmod, PgBpchar,
+    PgNumeric, PgType, cast_literal, cast_value, number_constant,
 };
 
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
@@ -659,6 +659,76 @@ fn pg18_types_every_numeric_constant() {
         let expected = pg_text(&mut conn, &expression);
         if got != expected {
             mismatches.push(format!("{text}: crate {got:?}, PostgreSQL {expected:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+const INTEGER_TYPES: [IntegerType; 3] = [
+    IntegerType::Smallint,
+    IntegerType::Integer,
+    IntegerType::Bigint,
+];
+
+/// Every arithmetic operator over every pair of integer types gives the type
+/// [`IntegerType::wider`] names.
+#[test]
+fn pg18_types_integer_arithmetic_as_the_wider_type() {
+    let mut conn = connect();
+    let mut mismatches = Vec::new();
+    for left in INTEGER_TYPES {
+        for right in INTEGER_TYPES {
+            let got = Ok(PgType::from(left.wider(right)).to_string());
+            let (left, right) = (PgType::from(left), PgType::from(right));
+            for operator in ["+", "-", "*", "/", "%"] {
+                let expression = format!("pg_typeof(6::{left} {operator} 4::{right})::text");
+                let expected = pg_text(&mut conn, &expression);
+                if got != expected {
+                    mismatches.push(format!(
+                        "{expression}: crate {got:?}, PostgreSQL {expected:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Every integer type holds the `bigint` values PostgreSQL's cast keeps, across
+/// [`IntegerType::range`], and refuses the rest with PostgreSQL's error.
+#[test]
+fn pg18_holds_every_bigint_in_every_integer_type() {
+    let (i16_min, i16_max) = (i64::from(i16::MIN), i64::from(i16::MAX));
+    let (i32_min, i32_max) = (i64::from(i32::MIN), i64::from(i32::MAX));
+    let values = [
+        i64::MIN,
+        i64::MIN + 1,
+        i32_min - 1,
+        i32_min,
+        i16_min - 1,
+        i16_min,
+        0,
+        i16_max,
+        i16_max + 1,
+        i32_max,
+        i32_max + 1,
+        i64::MAX,
+    ];
+    let mut conn = connect();
+    let mut mismatches = Vec::new();
+    for integer in INTEGER_TYPES {
+        for value in values {
+            let got = integer.value(value).map(|value| value.to_string());
+            if integer.range().contains(&value) != got.is_ok() {
+                mismatches.push(format!("{integer:?} {value}: range disagrees with {got:?}"));
+            }
+            let expression = format!("'{value}'::bigint::{}", PgType::from(integer));
+            let expected = pg_text(&mut conn, &expression);
+            if got != expected {
+                mismatches.push(format!(
+                    "{expression}: crate {got:?}, PostgreSQL {expected:?}"
+                ));
+            }
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
