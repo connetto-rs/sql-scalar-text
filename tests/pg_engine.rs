@@ -231,6 +231,7 @@ const TIMES: &[&str] = &[
     "12:00 Europe/Rome",
     "12:00 UTC",
     "12:00 Etc/GMT+5",
+    "12:00 EST5EDT5",
     "12:00 Japan",
     "12:00 America/New_York",
     "12:00 Europe/Nowhere",

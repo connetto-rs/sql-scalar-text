@@ -702,6 +702,39 @@ impl PgTimeZone {
         &self.name
     }
 
+    /// The zone's one offset east of UTC in seconds when it never changes, as
+    /// `pg_get_timezone_offset` finds it. A POSIX specification counts hours west of UTC, so
+    /// `+05:30` is five and a half hours behind it.
+    ///
+    /// ```
+    /// use sql_values::PgTimeZone;
+    ///
+    /// let offset = |setting| PgTimeZone::parse(setting).unwrap().fixed_offset();
+    /// assert_eq!(offset("UTC"), Some(0));
+    /// assert_eq!(offset("Etc/GMT+5"), Some(-18_000));
+    /// assert_eq!(offset("+2"), Some(7_200));
+    /// assert_eq!(offset("interval '-01:00'"), Some(-3_600));
+    /// assert_eq!(offset("+05:30"), Some(-19_800));
+    /// // Daylight saving time all year, and a daylight offset equal to the standard one.
+    /// assert_eq!(offset("EST5EDT,0/0,J365/26"), Some(-14_400));
+    /// assert_eq!(offset("EST5EDT5"), Some(-18_000));
+    /// // Daylight saving time that ends at the instant it starts again still has two offsets.
+    /// assert_eq!(offset("EST5EDT,0/0,J365/25"), None);
+    /// assert_eq!(offset("EST5EDT"), None);
+    /// assert_eq!(offset("Europe/Rome"), None);
+    /// ```
+    #[must_use]
+    pub fn fixed_offset(&self) -> Option<i32> {
+        match &self.rules {
+            Rules::Fixed { offset, .. } => Some(*offset),
+            Rules::Posix { rules, .. } => (!rules.switches || rules.std_offset == rules.dst_offset)
+                .then(|| rules.offset(true)),
+            // `load` keeps an IANA zone without transitions as `Fixed`, and every transition in
+            // jiff's database changes the offset.
+            Rules::Iana(_) => None,
+        }
+    }
+
     /// Seconds east of UTC in effect at `unix` seconds from 1970, as `pg_localtime` finds it, or
     /// `None` where an IANA zone is asked about an instant outside jiff's years.
     pub(crate) fn utc_offset(&self, unix: i64) -> Option<i32> {
@@ -756,16 +789,6 @@ impl PgTimeZone {
 }
 
 impl PgTimeZone {
-    /// `pg_get_timezone_offset`, the zone's one offset east of UTC when it never changes. A POSIX
-    /// specification in daylight saving time throughout has one too, but its rules need commas,
-    /// which no zone name inside a literal holds.
-    pub(crate) fn fixed_offset(&self) -> Option<i32> {
-        match &self.rules {
-            Rules::Fixed { offset, .. } => Some(*offset),
-            Rules::Posix { .. } | Rules::Iana(_) => None,
-        }
-    }
-
     /// `pg_timezone_abbrev_is_known`, the meaning of the uppercased `abbreviation` among the
     /// zone's own, and whether it has only that one.
     pub(crate) fn abbreviation_is_known(
