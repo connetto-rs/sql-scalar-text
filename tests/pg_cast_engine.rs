@@ -962,3 +962,52 @@ fn pg18_compares_every_value_pair() {
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
+
+/// Every value prints as PostgreSQL's output function prints it, converts back to the
+/// [`CastValue`] it came from at its type's width, and is the value each of its accessors gives.
+#[test]
+fn pg18_prints_and_converts_every_value() {
+    let all_targets = targets();
+    let target = |type_name: &str| {
+        all_targets
+            .iter()
+            .find(|(name, _)| *name == type_name)
+            .map_or_else(|| panic!("{type_name}"), |&(_, target)| target)
+    };
+    let mut conn = connect();
+    let mut mismatches = Vec::new();
+    for &(text, type_name) in COMPARED {
+        let target = target(type_name);
+        let cast = cast_literal(Literal::Quoted(text), target)
+            .unwrap_or_else(|error| panic!("{text:?}::{type_name}: {error}"));
+        let value = PgValue::try_from(cast.clone())
+            .unwrap_or_else(|value| panic!("{value:?} is no PgValue"));
+        let sql = format!("{}::{type_name}", quoted(text));
+        let expected = pg_text(&mut conn, &sql);
+        if Ok(value.to_string()) != expected {
+            mismatches.push(format!("{sql}: crate {value}, PostgreSQL {expected:?}"));
+        }
+        let accessed = [
+            value.as_numeric().map(PgValue::Numeric),
+            value.as_text().map(|text| PgValue::Text(text.into())),
+            value.as_date().map(PgValue::Date),
+            value.as_timestamp().map(PgValue::Timestamp),
+        ];
+        if accessed.iter().flatten().any(|accessed| *accessed != value) {
+            mismatches.push(format!("{sql}: an accessor gives another value"));
+        }
+        let width = IntegerType::try_from(target).unwrap_or(IntegerType::Bigint);
+        if value.into_cast_value(width) != Ok(cast) {
+            mismatches.push(format!("{sql}: the cast value does not come back"));
+        }
+    }
+    for (text, type_name) in [("ab", "char(4)"), ("2026-01-01 00:00+00", "timestamptz")] {
+        let cast = cast_literal(Literal::Quoted(text), target(type_name))
+            .unwrap_or_else(|error| panic!("{text:?}::{type_name}: {error}"));
+        match PgValue::try_from(cast.clone()) {
+            Err(refused) if refused == cast => {}
+            other => mismatches.push(format!("{text:?}::{type_name} gave {other:?}")),
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
