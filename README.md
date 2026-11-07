@@ -7,12 +7,12 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://github.com/connetto-rs/sql-values)
 [![license](https://img.shields.io/crates/l/sql-values.svg)](https://github.com/connetto-rs/sql-values/blob/main/LICENSE)
 
-`sql-values` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order, arithmetic and the explicit cast of a literal), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value. Dates and times are held as PostgreSQL stores them, over its whole range, and `timestamptz` arithmetic runs in a named time zone from jiff's bundled IANA database.
+`sql-values` holds the semantics of SQL values. It ports PostgreSQL's own value rules (input, canonical output, order, `numeric` and `interval` arithmetic, and the explicit cast of a literal), each checked against PostgreSQL 18, and it reads the text forms PostgreSQL, MySQL and SQLite emit for scalar values, so every wire-text consumer decodes the same spelling to the same Rust value. Dates and times are held as PostgreSQL stores them, over its whole range, and `timestamptz` arithmetic runs in a named time zone from jiff's bundled IANA database.
 
 ```rust
 use sql_values::{
-    CastTarget, InputContext, IntervalError, Literal, PgTimeZone, PgTimestampTz, cast_literal,
-    parse_bool, parse_interval, parse_timestamp,
+    CastTarget, InputContext, IntervalError, Literal, PgNumeric, PgTimeZone, PgTimestampTz,
+    cast_literal, parse_bool, parse_interval, parse_timestamp,
 };
 
 assert_eq!(parse_bool("t"), Some(true));
@@ -32,6 +32,9 @@ assert_eq!(before.to_string(), "2026-03-28 11:00:00+00");
 
 let level = cast_literal(Literal::Number("2.7"), CastTarget::Integer).unwrap();
 assert_eq!(level.to_string(), "3");
+
+let third = PgNumeric::parse("10").unwrap().checked_div(&PgNumeric::from(3)).unwrap();
+assert_eq!(third.to_string(), "3.3333333333333333");
 ```
 
 The crate supports `no_std`. Decimal parsing is available through the `decimal` feature, conversions to and from jiff's date and time types through the `jiff` feature, and `serde` derives for interval, date and time values through the `serde` feature.

@@ -1,5 +1,9 @@
 //! PostgreSQL `numeric` values as `numeric_in` reads them, `numeric_out` prints them,
-//! `cmp_numerics` orders them and the `numeric()` length coercion rounds them.
+//! `cmp_numerics` orders them, the `numeric()` length coercion rounds them and the operators and
+//! rounding functions compute them.
+
+mod arithmetic;
+mod magnitude;
 
 use alloc::vec::Vec;
 use core::{
@@ -8,7 +12,31 @@ use core::{
     hash::{Hash, Hasher},
 };
 
-use crate::cast::{CastError, PgType, is_pg_space};
+use crate::cast::{CastError, is_pg_space};
+use magnitude::Magnitude;
+
+/// Why PostgreSQL refuses to read or compute a `numeric`, one variant per message it raises.
+///
+/// ```
+/// use sql_values::{NumericError, PgNumeric};
+///
+/// assert_eq!(PgNumeric::parse("1.5x"), Err(NumericError::InvalidInputSyntax));
+/// let one = PgNumeric::from(1);
+/// let zero = PgNumeric::from(0);
+/// assert_eq!(one.checked_div(&zero), Err(NumericError::DivisionByZero));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum NumericError {
+    /// Text `numeric_in` cannot read.
+    #[error("invalid input syntax for type numeric")]
+    InvalidInputSyntax,
+    /// A value beyond the weight or display scale PostgreSQL stores.
+    #[error("value overflows numeric format")]
+    FormatOverflow,
+    /// A division or remainder by zero.
+    #[error("division by zero")]
+    DivisionByZero,
+}
 
 /// `NUMERIC_DSCALE_MAX`, the most digits after the point PostgreSQL stores.
 const MAX_DSCALE: i64 = 0x3FFF;
@@ -28,16 +56,14 @@ const SCALE_RANGE: core::ops::RangeInclusive<i16> = -1000..=1000;
 /// Its [`Display`](fmt::Display) is `numeric_out`, so equal values can print differently.
 ///
 /// ```
-/// use sql_values::{CastTarget, CastValue, Literal, cast_literal};
+/// use sql_values::PgNumeric;
 ///
-/// let numeric = |text| match cast_literal(Literal::Quoted(text), CastTarget::Numeric(None)) {
-///     Ok(CastValue::Numeric(value)) => value,
-///     other => panic!("{other:?}"),
-/// };
+/// let numeric = |text| PgNumeric::parse(text).unwrap();
 /// assert_eq!(numeric("1.50"), numeric("1.5"));
 /// assert_eq!(numeric("1.50").to_string(), "1.50");
 /// assert!(numeric("NaN") > numeric("Infinity"));
 /// assert!(numeric("-inf") < numeric("-1e1000"));
+/// assert_eq!(PgNumeric::from(-12_i64), numeric("-12.0"));
 /// ```
 #[derive(Debug, Clone)]
 pub struct PgNumeric(Repr);
@@ -90,9 +116,33 @@ impl NumericTypmod {
 }
 
 impl PgNumeric {
-    /// `numeric_in` with no type modifier, as an unknown literal is read before its cast.
-    pub(crate) fn parse(text: &str) -> Result<Self, CastError> {
-        let syntax = CastError::InvalidInputSyntax(PgType::Numeric);
+    /// `NaN`, equal to itself and above every other value.
+    pub const NAN: Self = Self(Repr::NaN);
+    /// `Infinity`.
+    pub const INFINITY: Self = Self(Repr::Infinity { negative: false });
+    /// `-Infinity`.
+    pub const NEG_INFINITY: Self = Self(Repr::Infinity { negative: true });
+
+    /// PostgreSQL's `numeric_in` with no type modifier, reading blanks, a sign, a decimal number
+    /// with an optional exponent, a `0x`, `0o` or `0b` integer, `NaN` or an infinity, then
+    /// blanks.
+    ///
+    /// # Errors
+    ///
+    /// [`NumericError::InvalidInputSyntax`] for text `numeric_in` cannot read, and
+    /// [`NumericError::FormatOverflow`] for a value beyond what PostgreSQL stores.
+    ///
+    /// ```
+    /// use sql_values::{NumericError, PgNumeric};
+    ///
+    /// assert_eq!(PgNumeric::parse(" -1_000.50 ").unwrap().to_string(), "-1000.50");
+    /// assert_eq!(PgNumeric::parse("0x1F").unwrap().to_string(), "31");
+    /// assert_eq!(PgNumeric::parse("1e-3").unwrap().to_string(), "0.001");
+    /// assert!(PgNumeric::parse("-inf").unwrap().is_infinite());
+    /// assert_eq!(PgNumeric::parse("1e131072"), Err(NumericError::FormatOverflow));
+    /// ```
+    pub fn parse(text: &str) -> Result<Self, NumericError> {
+        let syntax = NumericError::InvalidInputSyntax;
         let bytes = text.as_bytes();
         let start = bytes.iter().take_while(|&&b| is_pg_space(b)).count();
         let signed = &bytes[start..];
@@ -138,25 +188,45 @@ impl PgNumeric {
         Ok(Self(value))
     }
 
-    /// `int8_numeric`.
-    pub(crate) fn from_i64(value: i64) -> Self {
-        let mut digits = Vec::new();
-        let mut rest = value.unsigned_abs();
-        while rest > 0 {
-            // A remainder of ten is below `u8::MAX`.
-            digits.push(u8::try_from(rest % 10).expect("a decimal digit fits u8"));
-            rest /= 10;
-        }
-        digits.reverse();
-        let weight = i64::try_from(digits.len()).expect("an i64 has 19 digits") - 1;
-        let mut finite = Finite {
-            negative: value < 0,
-            digits,
-            weight,
-            dscale: 0,
-        };
-        finite.normalise();
-        Self(Repr::Finite(finite))
+    /// Whether the value is `NaN`.
+    #[must_use]
+    pub const fn is_nan(&self) -> bool {
+        matches!(self.0, Repr::NaN)
+    }
+
+    /// Whether the value is `Infinity` or `-Infinity`.
+    #[must_use]
+    pub const fn is_infinite(&self) -> bool {
+        matches!(self.0, Repr::Infinity { .. })
+    }
+
+    /// Whether the value is zero, at any display scale.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        matches!(&self.0, Repr::Finite(finite) if finite.digits.is_empty())
+    }
+
+    /// Whether the value is below zero, `-Infinity` included.
+    #[must_use]
+    pub const fn is_negative(&self) -> bool {
+        matches!(
+            self.0,
+            Repr::Infinity { negative: true } | Repr::Finite(Finite { negative: true, .. })
+        )
+    }
+
+    /// Whether the value is a finite whole number, at any display scale.
+    ///
+    /// ```
+    /// use sql_values::PgNumeric;
+    ///
+    /// assert!(PgNumeric::parse("2.00").unwrap().is_integral());
+    /// assert!(!PgNumeric::parse("2.5").unwrap().is_integral());
+    /// assert!(!PgNumeric::INFINITY.is_integral());
+    /// ```
+    #[must_use]
+    pub fn is_integral(&self) -> bool {
+        matches!(&self.0, Repr::Finite(finite) if finite.exponent() >= 0)
     }
 
     /// The `numeric()` length coercion to `typmod`, rounding half away from zero.
@@ -278,13 +348,70 @@ impl Finite {
         }
     }
 
+    /// `int64_to_numeric`.
+    fn from_i64(value: i64) -> Self {
+        let mut digits = Vec::new();
+        let mut rest = value.unsigned_abs();
+        while rest > 0 {
+            digits.push(u8::try_from(rest % 10).expect("a decimal digit fits u8"));
+            rest /= 10;
+        }
+        digits.reverse();
+        let weight = i64::try_from(digits.len()).expect("an i64 has 19 digits") - 1;
+        let mut finite = Self {
+            negative: value < 0,
+            digits,
+            weight,
+            dscale: 0,
+        };
+        finite.normalise();
+        finite
+    }
+
+    /// The power of ten of the last digit, `1` for zero.
+    fn exponent(&self) -> i64 {
+        self.weight + 1 - i64::try_from(self.digits.len()).expect("a digit count fits i64")
+    }
+
+    /// The digits as an integer followed by `zeros` zeros, the value's magnitude over
+    /// `10^(exponent - zeros)`.
+    fn mantissa(&self, zeros: i64) -> Magnitude {
+        let zeros = usize::try_from(zeros).expect("a shift toward a lower exponent");
+        Magnitude::from_digits(&self.digits, zeros)
+    }
+
+    /// The value `±mantissa × 10^exponent` printed with `dscale` digits after the point.
+    fn from_mantissa(negative: bool, mantissa: &Magnitude, exponent: i64, dscale: i64) -> Self {
+        let digits = mantissa.decimal_digits();
+        let weight = exponent + i64::try_from(digits.len()).expect("a digit count fits i64") - 1;
+        let mut finite = Self {
+            negative,
+            digits,
+            weight,
+            dscale,
+        };
+        finite.normalise();
+        finite
+    }
+
+    /// `trunc_var` toward zero at `scale` digits after the point, with a non-negative display
+    /// scale.
+    fn truncate(&mut self, scale: i64) {
+        self.dscale = scale.max(0);
+        let kept = usize::try_from(self.weight + scale + 1).unwrap_or(0);
+        if kept < self.digits.len() {
+            self.digits.truncate(kept);
+            self.normalise();
+        }
+    }
+
     /// `make_result`'s check that the weight and display scale fit their stored fields.
-    fn check_storable(&self) -> Result<(), CastError> {
+    fn check_storable(&self) -> Result<(), NumericError> {
         let weight_fits = self.digits.is_empty() || self.weight <= MAX_WEIGHT;
         if weight_fits && self.dscale <= MAX_DSCALE {
             Ok(())
         } else {
-            Err(CastError::NumericFormatOverflow)
+            Err(NumericError::FormatOverflow)
         }
     }
 
@@ -297,8 +424,8 @@ impl Finite {
 }
 
 /// `set_var_from_str` from the first digit or point, returning the value and the unread rest.
-fn parse_decimal(bytes: &[u8]) -> Result<(Finite, &[u8]), CastError> {
-    let syntax = CastError::InvalidInputSyntax(PgType::Numeric);
+fn parse_decimal(bytes: &[u8]) -> Result<(Finite, &[u8]), NumericError> {
+    let syntax = NumericError::InvalidInputSyntax;
     let mut digits = Vec::new();
     let mut integer_digits: i64 = 0;
     let mut dscale: i64 = 0;
@@ -362,7 +489,7 @@ fn parse_decimal(bytes: &[u8]) -> Result<(Finite, &[u8]), CastError> {
                 b'0'..=b'9' => {
                     exponent = exponent * 10 + i64::from(byte - b'0');
                     if exponent > MAX_EXPONENT {
-                        return Err(CastError::NumericFormatOverflow);
+                        return Err(NumericError::FormatOverflow);
                     }
                     at += 1;
                 }
@@ -391,15 +518,15 @@ fn parse_decimal(bytes: &[u8]) -> Result<(Finite, &[u8]), CastError> {
 
 /// `set_var_from_non_decimal_integer_str` after the base prefix, checking the weight after each
 /// group of digits that fills an `int64` as PostgreSQL does.
-fn parse_non_decimal(bytes: &[u8], base: u32) -> Result<(Finite, &[u8]), CastError> {
-    let syntax = CastError::InvalidInputSyntax(PgType::Numeric);
+fn parse_non_decimal(bytes: &[u8], base: u32) -> Result<(Finite, &[u8]), NumericError> {
+    let syntax = NumericError::InvalidInputSyntax;
     // `mul > PG_INT64_MAX / base` starts a new group after this many digits.
     let group_len = match base {
         16 => 15,
         8 => 20,
         _ => 62,
     };
-    let mut limbs = Limbs::default();
+    let mut limbs = Magnitude::default();
     let mut group: u64 = 0;
     let mut group_digits: u32 = 0;
     let mut at = 0;
@@ -408,7 +535,7 @@ fn parse_non_decimal(bytes: &[u8], base: u32) -> Result<(Finite, &[u8]), CastErr
             if group_digits == group_len {
                 limbs.push_group(group, base, group_digits);
                 if limbs.decimal_weight() > MAX_WEIGHT {
-                    return Err(CastError::NumericFormatOverflow);
+                    return Err(NumericError::FormatOverflow);
                 }
                 group = 0;
                 group_digits = 0;
@@ -433,71 +560,9 @@ fn parse_non_decimal(bytes: &[u8], base: u32) -> Result<(Finite, &[u8]), CastErr
     }
     limbs.push_group(group, base, group_digits);
     if limbs.decimal_weight() > MAX_WEIGHT {
-        return Err(CastError::NumericFormatOverflow);
+        return Err(NumericError::FormatOverflow);
     }
-    Ok((limbs.into_finite(), &bytes[at..]))
-}
-
-/// A non-negative integer in base 10^9 limbs, least significant first.
-#[derive(Default)]
-struct Limbs(Vec<u32>);
-
-const LIMB: u128 = 1_000_000_000;
-
-impl Limbs {
-    /// Multiply by `base^digits` and add `group`.
-    fn push_group(&mut self, group: u64, base: u32, digits: u32) {
-        let factor = u128::from(base).pow(digits);
-        let mut carry = u128::from(group);
-        for limb in &mut self.0 {
-            let value = u128::from(*limb) * factor + carry;
-            *limb = u32::try_from(value % LIMB).expect("a limb is below 10^9");
-            carry = value / LIMB;
-        }
-        while carry > 0 {
-            self.0
-                .push(u32::try_from(carry % LIMB).expect("a limb is below 10^9"));
-            carry /= LIMB;
-        }
-    }
-
-    /// The decimal digits, most significant first, with leading zeros.
-    fn decimal_digits(&self) -> Vec<u8> {
-        let mut digits = Vec::with_capacity(self.0.len() * 9);
-        for &limb in self.0.iter().rev() {
-            let mut rest = limb;
-            let mut chunk = [0u8; 9];
-            for slot in chunk.iter_mut().rev() {
-                *slot = u8::try_from(rest % 10).expect("a decimal digit fits u8");
-                rest /= 10;
-            }
-            digits.extend_from_slice(&chunk);
-        }
-        digits
-    }
-
-    /// The power of ten of the leading digit, `-1` for zero.
-    fn decimal_weight(&self) -> i64 {
-        let Some(&top) = self.0.last() else {
-            return -1;
-        };
-        let top_digits = top.checked_ilog10().map_or(0, |log| i64::from(log) + 1);
-        let lower = i64::try_from(self.0.len() - 1).expect("a limb count fits i64") * 9;
-        lower + top_digits - 1
-    }
-
-    fn into_finite(self) -> Finite {
-        let digits = self.decimal_digits();
-        let weight = i64::try_from(digits.len()).expect("a digit count fits i64") - 1;
-        let mut finite = Finite {
-            negative: false,
-            digits,
-            weight,
-            dscale: 0,
-        };
-        finite.normalise();
-        finite
-    }
+    Ok((Finite::from_mantissa(false, &limbs, 0, 0), &bytes[at..]))
 }
 
 /// `pg_strncasecmp(bytes, word, word.len()) == 0`.
@@ -579,5 +644,26 @@ impl Hash for PgNumeric {
             finite.weight.hash(state);
             finite.digits.hash(state);
         }
+    }
+}
+
+/// `int2_numeric`.
+impl From<i16> for PgNumeric {
+    fn from(value: i16) -> Self {
+        Self::from(i64::from(value))
+    }
+}
+
+/// `int4_numeric`.
+impl From<i32> for PgNumeric {
+    fn from(value: i32) -> Self {
+        Self::from(i64::from(value))
+    }
+}
+
+/// `int8_numeric`.
+impl From<i64> for PgNumeric {
+    fn from(value: i64) -> Self {
+        Self(Repr::Finite(Finite::from_i64(value)))
     }
 }

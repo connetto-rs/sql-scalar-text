@@ -19,7 +19,7 @@ pub use interval::{
     IntervalError, IntervalFields, IntervalSum, IntervalTypmod, PgInterval, ShiftError,
     parse_interval, parse_interval_typmod,
 };
-pub use numeric::{NumericTypmod, PgNumeric};
+pub use numeric::{NumericError, NumericTypmod, PgNumeric};
 pub use zone::{PgTimeZone, TimeZoneAbbreviations, TimeZoneAbbreviationsError, TimeZoneError};
 
 use alloc::vec::Vec;
