@@ -21,7 +21,7 @@ use diesel::{
 };
 use sql_values::{
     CastError, CastTarget, CastValue, CharLength, Literal, NumericTypmod, PgNumeric, PgType,
-    cast_literal,
+    cast_literal, cast_value, number_constant,
 };
 
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
@@ -394,13 +394,16 @@ fn pg_error(message: &str) -> CastError {
         CastError::DateTimeFieldOutOfRange,
         CastError::DateOutOfRange,
         CastError::TimestampOutOfRange,
+        CastError::DateOutOfRangeForTimestamp,
         CastError::TimeZoneDisplacementOutOfRange,
     ];
     for pg_type in types {
         errors.push(CastError::InvalidInputSyntax(pg_type));
         errors.push(CastError::ValueOutOfRange(pg_type));
         errors.push(CastError::OutOfRange(pg_type));
-        for from in [PgType::Integer, PgType::Bigint, PgType::Numeric] {
+        errors.push(CastError::CannotConvertNaN(pg_type));
+        errors.push(CastError::CannotConvertInfinity(pg_type));
+        for from in types {
             errors.push(CastError::CannotCast { from, to: pg_type });
         }
     }
@@ -537,6 +540,124 @@ fn pg18_orders_and_equates_every_numeric_pair() {
                     "{left_text:?} and {right_text:?} are equal but hash apart"
                 ));
             }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Typed values of every source type, each as the literal and the type PostgreSQL reads it as.
+const VALUES: &[(&str, &str)] = &[
+    ("true", "boolean"),
+    ("false", "boolean"),
+    ("0", "smallint"),
+    ("-32768", "smallint"),
+    ("1", "integer"),
+    ("0", "integer"),
+    ("-1", "integer"),
+    ("40000", "integer"),
+    ("-2147483648", "integer"),
+    ("1", "bigint"),
+    ("40000", "bigint"),
+    ("2147483648", "bigint"),
+    ("-9223372036854775808", "bigint"),
+    ("0", "numeric"),
+    ("2.5", "numeric"),
+    ("-2.5", "numeric"),
+    ("1.50", "numeric"),
+    ("12.345", "numeric"),
+    ("32767.5", "numeric"),
+    ("2147483647.5", "numeric"),
+    ("9223372036854775807.5", "numeric"),
+    ("1e20", "numeric"),
+    ("NaN", "numeric"),
+    ("Infinity", "numeric"),
+    ("-Infinity", "numeric"),
+    ("x", "text"),
+    ("t", "text"),
+    (" yes ", "text"),
+    (" 12 ", "text"),
+    ("2.5", "text"),
+    ("0x1F", "text"),
+    ("2026-01-01", "text"),
+    ("2026-01-01 10:00:00.5", "text"),
+    ("ab  ", "text"),
+    ("abcdef", "varchar"),
+    ("ab", "char(4)"),
+    ("t", "char(4)"),
+    ("12", "char(4)"),
+    ("ab  ", "bpchar"),
+    ("2026-01-01", "date"),
+    ("4714-11-24 BC", "date"),
+    ("294276-12-31", "date"),
+    ("294277-01-01", "date"),
+    ("5874897-12-31", "date"),
+    ("infinity", "date"),
+    ("-infinity", "date"),
+    ("2026-01-01 23:59:59.9", "timestamp"),
+    ("2026-01-01 10:00:00.123456", "timestamp"),
+    ("294276-12-31 23:59:59.999999", "timestamp"),
+    ("4714-11-24 00:00:00 BC", "timestamp"),
+    ("infinity", "timestamp"),
+    ("-infinity", "timestamp"),
+    ("2026-01-01 10:00:00.5+02", "timestamptz"),
+    ("infinity", "timestamptz"),
+];
+
+/// Every typed value under every target, skipping the casts the crate declines.
+#[test]
+fn pg18_casts_every_value_to_every_target() {
+    let mut conn = connect();
+    let mut mismatches = Vec::new();
+    let mut answered = 0;
+    let all_targets = targets();
+    for &(text, source_name) in VALUES {
+        let source = all_targets
+            .iter()
+            .find(|(name, _)| *name == source_name)
+            .map_or_else(|| panic!("{source_name}"), |&(_, target)| target);
+        let value = cast_literal(Literal::Quoted(text), source)
+            .unwrap_or_else(|error| panic!("{text:?}::{source_name}: {error}"));
+        for &(type_name, target) in &all_targets {
+            let got = match cast_value(value.clone(), target) {
+                Err(CastError::Unsupported) => continue,
+                got => got.map(|value| value.to_string()),
+            };
+            answered += 1;
+            let expression = format!("({}::{source_name})::{type_name}", quoted(text));
+            let expected = pg_text(&mut conn, &expression);
+            if got != expected {
+                mismatches.push(format!(
+                    "{expression}: crate {got:?}, PostgreSQL {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    assert!(answered > 1_000, "only {answered} casts answered");
+}
+
+/// Every numeric constant gets the type and the value PostgreSQL's `make_const` gives it.
+#[test]
+fn pg18_types_every_numeric_constant() {
+    let mut conn = connect();
+    let mut mismatches = Vec::new();
+    for &text in NUMBERS {
+        let got = match number_constant(text) {
+            Err(CastError::Unsupported) => continue,
+            got => got.map(|value| {
+                let type_name = match value {
+                    CastValue::Integer(_) => "integer",
+                    CastValue::Bigint(_) => "bigint",
+                    CastValue::Numeric(_) => "numeric",
+                    other => panic!("{text:?} typed as {other:?}"),
+                };
+                format!("{type_name}|{value}")
+            }),
+        };
+        let expression = format!("pg_typeof({text})::text || '|' || ({text})::text");
+        let expected = pg_text(&mut conn, &expression);
+        if got != expected {
+            mismatches.push(format!("{text}: crate {got:?}, PostgreSQL {expected:?}"));
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
