@@ -38,7 +38,7 @@ fn assert_reads_back(text: &str, target: CastTarget, value: &CastValue) {
             assert!(clipped.chars().count() <= length, "{text:?} as {clipped:?}");
         }
         (CastTarget::Bpchar(Some(_)), CastValue::Bpchar(padded)) => {
-            assert_eq!(padded.chars().count(), length, "{text:?} as {padded:?}");
+            assert_eq!(padded.as_str().chars().count(), length, "{text:?} as {padded:?}");
         }
         (CastTarget::Text | CastTarget::Varchar(None) | CastTarget::Bpchar(None), _) => {}
         _ => {

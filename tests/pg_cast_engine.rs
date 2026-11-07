@@ -20,8 +20,8 @@ use diesel::{
     sql_types::{Bool, Integer, Text},
 };
 use sql_values::{
-    CastError, CastTarget, CastValue, CharLength, Literal, NumericTypmod, PgNumeric, PgType,
-    cast_literal, cast_value, number_constant,
+    CastError, CastTarget, CastValue, CharLength, Literal, NumericTypmod, PgBpchar, PgNumeric,
+    PgType, cast_literal, cast_value, number_constant,
 };
 
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
@@ -659,6 +659,116 @@ fn pg18_types_every_numeric_constant() {
         let expected = pg_text(&mut conn, &expression);
         if got != expected {
             mismatches.push(format!("{text}: crate {got:?}, PostgreSQL {expected:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Texts a `char(n)` row image or a literal carries, blank-padded or not, with the blanks
+/// PostgreSQL drops and the whitespace it keeps.
+const BPCHARS: &[&str] = &[
+    "",
+    " ",
+    "    ",
+    "ab",
+    "ab ",
+    "ab  ",
+    "ab   ",
+    " ab",
+    " ab ",
+    "a b",
+    "AB",
+    "ab\t",
+    "ab\t ",
+    "ab\n",
+    "ab\u{a0}",
+    "ab\u{3000}",
+    "é",
+    "é  ",
+];
+
+/// What PostgreSQL's `=` answers for `left = right`, both written inline.
+fn pg_equal(conn: &mut PgConnection, left: &str, right: &str) -> bool {
+    // Raw SQL with the literals inline, since a bound parameter is typed `text` and resolves
+    // the operator as `text` does, never as the unknown literal under test.
+    diesel::select(sql::<Bool>(&format!("{left} = {right}")))
+        .get_result(conn)
+        .unwrap_or_else(|e| panic!("{left} = {right}: {e}"))
+}
+
+/// Every pair of `bpchar` values equates as `bpchareq` does, against an untyped literal, a
+/// `varchar`, a `bpchar` and a `char(n)`, and equal pairs hash equal.
+#[test]
+fn pg18_equates_every_bpchar_pair() {
+    let mut conn = connect();
+    let hasher = RandomState::new();
+    let mut mismatches = Vec::new();
+    for left_text in BPCHARS {
+        let left = PgBpchar::new(*left_text);
+        for right_text in BPCHARS {
+            let right = PgBpchar::new(*right_text);
+            for right_sql in [
+                quoted(right_text),
+                format!("{}::varchar", quoted(right_text)),
+                format!("{}::bpchar", quoted(right_text)),
+            ] {
+                let expected = pg_equal(
+                    &mut conn,
+                    &format!("{}::bpchar", quoted(left_text)),
+                    &right_sql,
+                );
+                if (left == right) != expected {
+                    mismatches.push(format!(
+                        "{left_text:?}::bpchar = {right_sql}: crate {}, PostgreSQL {expected}",
+                        left == right
+                    ));
+                }
+            }
+            if left == right && hasher.hash_one(&left) != hasher.hash_one(&right) {
+                mismatches.push(format!(
+                    "{left_text:?} and {right_text:?} are equal but hash apart"
+                ));
+            }
+        }
+        let column = format!("{}::char(4)", quoted(left_text));
+        let padded = match cast_literal(
+            Literal::Quoted(left_text),
+            CastTarget::Bpchar(CharLength::new(4)),
+        ) {
+            Ok(CastValue::Bpchar(value)) => value,
+            other => panic!("{column}: {other:?}"),
+        };
+        for right_text in BPCHARS {
+            let expected = pg_equal(&mut conn, &column, &quoted(right_text));
+            let got = padded == PgBpchar::new(*right_text);
+            if got != expected {
+                mismatches.push(format!(
+                    "{column} = {right_text:?}: crate {got}, PostgreSQL {expected}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+/// Every `bpchar` value compared with a `text` value through the `bpchar::text` cast equates as
+/// `texteq` does after that cast.
+#[test]
+fn pg18_equates_every_bpchar_with_every_text() {
+    let mut conn = connect();
+    let mut mismatches = Vec::new();
+    for left_text in BPCHARS {
+        let left = PgBpchar::new(*left_text);
+        for right_text in BPCHARS {
+            let left_sql = format!("{}::bpchar", quoted(left_text));
+            let right_sql = format!("{}::text", quoted(right_text));
+            let expected = pg_equal(&mut conn, &left_sql, &right_sql);
+            let got = left.as_text() == *right_text;
+            if got != expected {
+                mismatches.push(format!(
+                    "{left_sql} = {right_sql}: crate {got}, PostgreSQL {expected}"
+                ));
+            }
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));

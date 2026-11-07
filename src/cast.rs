@@ -6,6 +6,7 @@ use alloc::string::{String, ToString};
 use core::fmt;
 
 use crate::{
+    bpchar::PgBpchar,
     datetime::{DateTimeError, InputContext, PgDate, PgTimestamp, PgTimestampTz},
     numeric::{NumericError, NumericTypmod, PgNumeric},
 };
@@ -188,9 +189,9 @@ pub enum CastValue {
     Numeric(PgNumeric),
     /// A `text` or `varchar`.
     Text(String),
-    /// A `char(n)`, blank-padded to its length as PostgreSQL holds it. PostgreSQL drops the
-    /// trailing blanks when it compares it with `text` or casts it to `text`.
-    Bpchar(String),
+    /// A `char(n)`, blank-padded to its length as PostgreSQL holds it, equal to another as
+    /// PostgreSQL finds it, ignoring trailing blanks.
+    Bpchar(PgBpchar<'static>),
     /// A `date`.
     Date(PgDate),
     /// A `timestamp`.
@@ -409,10 +410,10 @@ pub fn cast_value(value: CastValue, target: CastTarget) -> Result<CastValue, Cas
     match (value, target) {
         (CastValue::Text(text), _) => cast_quoted(&text, target),
         // `rtrim1`, dropping the blanks `char(n)` pads with.
-        (CastValue::Bpchar(text), CastTarget::Text | CastTarget::Varchar(_)) => {
-            Ok(character(text.trim_end_matches(' '), target))
+        (CastValue::Bpchar(value), CastTarget::Text | CastTarget::Varchar(_)) => {
+            Ok(character(value.as_text(), target))
         }
-        (CastValue::Bpchar(text), _) => cast_quoted(&text, target),
+        (CastValue::Bpchar(value), _) => cast_quoted(value.as_str(), target),
         (
             CastValue::TimestampTz(_),
             CastTarget::Date
@@ -666,9 +667,9 @@ fn character(text: &str, target: CastTarget) -> CastValue {
             let mut padded = String::from(clipped);
             let blanks = length.0 - clipped.chars().count();
             padded.extend(core::iter::repeat_n(' ', blanks));
-            CastValue::Bpchar(padded)
+            CastValue::Bpchar(PgBpchar::new(padded))
         }
-        CastTarget::Bpchar(None) => CastValue::Bpchar(text.into()),
+        CastTarget::Bpchar(None) => CastValue::Bpchar(PgBpchar::new(String::from(text))),
         _ => CastValue::Text(text.into()),
     }
 }
@@ -835,7 +836,8 @@ impl fmt::Display for CastValue {
             Self::Integer(value) => write!(f, "{value}"),
             Self::Bigint(value) => write!(f, "{value}"),
             Self::Numeric(value) => write!(f, "{value}"),
-            Self::Text(text) | Self::Bpchar(text) => f.write_str(text),
+            Self::Text(text) => f.write_str(text),
+            Self::Bpchar(value) => write!(f, "{value}"),
             Self::Date(date) => write!(f, "{date}"),
             Self::Timestamp(at) => write!(f, "{at}"),
             Self::TimestampTz(at) => write!(f, "{at}"),
