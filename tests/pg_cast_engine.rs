@@ -489,7 +489,8 @@ fn pg_numeric_cmp(conn: &mut PgConnection, left: &str, right: &str) -> Ordering 
     cmp.cmp(&0)
 }
 
-/// Every pair of numerics orders as `numeric_cmp` orders it, and equal pairs hash equal.
+/// Every pair of numerics, in both orders, orders as `numeric_cmp` orders it, and equal pairs hash
+/// equal.
 #[test]
 fn pg18_orders_and_equates_every_numeric_pair() {
     let mut conn = connect();
@@ -522,8 +523,8 @@ fn pg18_orders_and_equates_every_numeric_pair() {
     ];
     let hasher = RandomState::new();
     let mut mismatches = Vec::new();
-    for (index, left_text) in texts.iter().enumerate() {
-        for right_text in &texts[index..] {
+    for left_text in &texts {
+        for right_text in &texts {
             let (left, right) = (numeric(left_text), numeric(right_text));
             let expected = pg_numeric_cmp(&mut conn, left_text, right_text);
             if left.cmp(&right) != expected {
