@@ -8,6 +8,7 @@ use core::fmt;
 use crate::{
     bpchar::PgBpchar,
     datetime::{DateTimeError, InputContext, PgDate, PgTimestamp, PgTimestampTz},
+    integer::IntegerType,
     numeric::{NumericError, NumericTypmod, PgNumeric},
 };
 
@@ -349,15 +350,10 @@ pub fn number_constant(text: &str) -> Result<CastValue, CastError> {
     let unsigned = text.strip_prefix('-').unwrap_or(text);
     match scan_number(unsigned.as_bytes()) {
         None => Err(CastError::Unsupported),
-        Some(NumberToken::Integer) => {
-            if let Ok(value) = int_in(text, 32) {
-                Ok(CastValue::Integer(narrow(value)))
-            } else if let Ok(value) = int_in(text, 64) {
-                Ok(CastValue::Bigint(value))
-            } else {
-                numeric_input(text).map(CastValue::Numeric)
-            }
-        }
+        Some(NumberToken::Integer) => [IntegerType::Integer, IntegerType::Bigint]
+            .into_iter()
+            .find_map(|integer| int_input(text, integer).ok())
+            .map_or_else(|| numeric_input(text).map(CastValue::Numeric), Ok),
         Some(NumberToken::Decimal) => numeric_input(text).map(CastValue::Numeric),
     }
 }
@@ -502,17 +498,12 @@ impl CastValue {
 /// The integer narrowings `int82`, `int84` and `int42`, or `int*_numeric` and the `numeric()`
 /// length coercion, of an integer to a target that [`CastTarget::takes_integer`].
 fn integer(value: i64, target: CastTarget) -> Result<CastValue, CastError> {
-    let out_of_range = CastError::OutOfRange(target.pg_type());
-    match target {
-        CastTarget::Smallint => i16::try_from(value)
-            .map(CastValue::Smallint)
-            .map_err(|_| out_of_range),
-        CastTarget::Integer => i32::try_from(value)
-            .map(CastValue::Integer)
-            .map_err(|_| out_of_range),
-        CastTarget::Numeric(typmod) => numeric_typmod(PgNumeric::from(value), typmod),
-        _ => Ok(CastValue::Bigint(value)),
+    if let CastTarget::Numeric(typmod) = target {
+        return numeric_typmod(PgNumeric::from(value), typmod);
     }
+    IntegerType::try_from(target)
+        .expect("a target taking an integer is numeric or an integer type")
+        .value(value)
 }
 
 /// `timestamp_scale`, the timestamp rounded to the target's precision.
@@ -617,13 +608,9 @@ fn cast_quoted(text: &str, target: CastTarget) -> Result<CastValue, CastError> {
     }
     match target {
         CastTarget::Boolean => bool_in(text).map(CastValue::Boolean),
-        CastTarget::Smallint => int_input(text, 16, PgType::Smallint).map(|v| {
-            CastValue::Smallint(i16::try_from(v).expect("int_in kept the value in 16 bits"))
-        }),
-        CastTarget::Integer => {
-            int_input(text, 32, PgType::Integer).map(|v| CastValue::Integer(narrow(v)))
-        }
-        CastTarget::Bigint => int_input(text, 64, PgType::Bigint).map(CastValue::Bigint),
+        CastTarget::Smallint => int_input(text, IntegerType::Smallint),
+        CastTarget::Integer => int_input(text, IntegerType::Integer),
+        CastTarget::Bigint => int_input(text, IntegerType::Bigint),
         CastTarget::Numeric(typmod) => numeric_typmod(numeric_input(text)?, typmod),
         CastTarget::Text | CastTarget::Varchar(_) | CastTarget::Bpchar(_) => {
             Ok(character(text, target))
@@ -642,11 +629,6 @@ fn cast_quoted(text: &str, target: CastTarget) -> Result<CastValue, CastError> {
             Ok(CastValue::TimestampTz(PgTimestampTz::from_stored(micros)))
         }
     }
-}
-
-/// An `i64` `int_in` read within 32 bits.
-fn narrow(value: i64) -> i32 {
-    i32::try_from(value).expect("int_in kept the value in 32 bits")
 }
 
 fn numeric_typmod(value: PgNumeric, typmod: Option<NumericTypmod>) -> Result<CastValue, CastError> {
@@ -723,18 +705,21 @@ enum IntInputError {
     Range,
 }
 
-/// `int_in` for a type of `bits`, mapping its refusal to the error naming `pg_type`.
-fn int_input(text: &str, bits: u32, pg_type: PgType) -> Result<i64, CastError> {
-    int_in(text, bits).map_err(|error| match error {
-        IntInputError::Syntax => CastError::InvalidInputSyntax(pg_type),
-        IntInputError::Range => CastError::ValueOutOfRange(pg_type),
-    })
+/// `int_in` read as `integer`, mapping its refusal to the error naming that type.
+fn int_input(text: &str, integer: IntegerType) -> Result<CastValue, CastError> {
+    let value = int_in(text, integer).map_err(|error| match error {
+        IntInputError::Syntax => CastError::InvalidInputSyntax(integer.into()),
+        IntInputError::Range => CastError::ValueOutOfRange(integer.into()),
+    })?;
+    Ok(integer
+        .value(value)
+        .expect("int_in kept the value in the type's range"))
 }
 
-/// `pg_strtoint16`, `pg_strtoint32` or `pg_strtoint64` by `bits`, reading blanks, a sign, a
+/// `pg_strtoint16`, `pg_strtoint32` or `pg_strtoint64` by `integer`, reading blanks, a sign, a
 /// decimal, `0x`, `0o` or `0b` integer with single underscores between digits, then blanks. An
 /// overflow stops the read where it happens, before any trailing junk is seen.
-fn int_in(text: &str, bits: u32) -> Result<i64, IntInputError> {
+fn int_in(text: &str, integer: IntegerType) -> Result<i64, IntInputError> {
     let bytes = text.as_bytes();
     let mut at = bytes.iter().take_while(|&&b| is_pg_space(b)).count();
     let negative = bytes.get(at) == Some(&b'-');
@@ -751,7 +736,7 @@ fn int_in(text: &str, bits: u32) -> Result<i64, IntInputError> {
     let first_digit = at;
     let is_digit = |byte: Option<&u8>| byte.is_some_and(|&b| char::from(b).is_digit(radix));
     // The magnitude of the type's minimum, which a negative value reaches.
-    let limit: u64 = 1 << (bits - 1);
+    let limit = integer.range().start().unsigned_abs();
     let mut magnitude: u64 = 0;
     loop {
         match bytes.get(at) {
@@ -783,12 +768,10 @@ fn int_in(text: &str, bits: u32) -> Result<i64, IntInputError> {
     } else {
         i128::from(magnitude)
     };
-    let range = -i128::from(limit)..i128::from(limit);
-    if range.contains(&value) {
-        Ok(i64::try_from(value).expect("a value within 64 bits fits i64"))
-    } else {
-        Err(IntInputError::Range)
-    }
+    i64::try_from(value)
+        .ok()
+        .filter(|value| integer.range().contains(value))
+        .ok_or(IntInputError::Range)
 }
 
 /// `AdjustTimestampForTypmod`, rounding a finite timestamp half away from 2000-01-01 to
