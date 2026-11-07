@@ -188,3 +188,55 @@ fn pg18_classifies_every_operand() {
     }
     compare(&mut conn, cases);
 }
+
+/// Non-decimal zeros, and hexadecimal integers either side of the largest weight PostgreSQL
+/// stores, refused once at the check after a full group of digits and once after the last one.
+#[test]
+fn pg18_reads_non_decimal_integers_at_the_weight_bound() {
+    let mut conn = answers::connect(&PG18, PG18_TAG);
+    let hex = |digits| format!("0x{}", "F".repeat(digits));
+    let texts = [
+        "0x0".to_owned(),
+        "-0o_0".to_owned(),
+        "0b0".to_owned(),
+        hex(108_852),
+        hex(108_853),
+        hex(108_856),
+    ];
+    let cases = texts
+        .iter()
+        .map(|text| {
+            (
+                format!("SELECT {}::text", sql(text)),
+                Answer::of(PgNumeric::parse(text)),
+            )
+        })
+        .collect();
+    compare(&mut conn, cases);
+}
+
+/// `int2_numeric`, `int4_numeric` and `int8_numeric` at each type's bounds.
+#[test]
+fn pg18_converts_every_integer_type() {
+    let mut conn = answers::connect(&PG18, PG18_TAG);
+    let mut cases = Vec::new();
+    for value in [i16::MIN, -1, 0, i16::MAX] {
+        cases.push((
+            format!("SELECT ({value})::smallint::numeric::text"),
+            Answer::Value(PgNumeric::from(value).to_string()),
+        ));
+    }
+    for value in [i32::MIN, i32::MAX] {
+        cases.push((
+            format!("SELECT ({value})::integer::numeric::text"),
+            Answer::Value(PgNumeric::from(value).to_string()),
+        ));
+    }
+    for value in [i64::MIN, i64::MAX] {
+        cases.push((
+            format!("SELECT ({value})::bigint::numeric::text"),
+            Answer::Value(PgNumeric::from(value).to_string()),
+        ));
+    }
+    compare(&mut conn, cases);
+}

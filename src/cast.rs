@@ -534,12 +534,14 @@ fn numeric_typmod(value: PgNumeric, typmod: Option<NumericTypmod>) -> Result<Cas
     .map(CastValue::Numeric)
 }
 
-/// `numeric_in`, its refusal as the cast error.
+/// `numeric_in`, its refusal as the cast error. It raises only a syntax error or an overflow.
 fn numeric_input(text: &str) -> Result<PgNumeric, CastError> {
-    PgNumeric::parse(text).map_err(|error| match error {
-        NumericError::InvalidInputSyntax => CastError::InvalidInputSyntax(PgType::Numeric),
-        NumericError::FormatOverflow => CastError::NumericFormatOverflow,
-        NumericError::DivisionByZero => unreachable!("numeric_in never divides"),
+    PgNumeric::parse(text).map_err(|error| {
+        if error == NumericError::InvalidInputSyntax {
+            CastError::InvalidInputSyntax(PgType::Numeric)
+        } else {
+            CastError::NumericFormatOverflow
+        }
     })
 }
 
