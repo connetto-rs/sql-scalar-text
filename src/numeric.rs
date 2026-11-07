@@ -556,7 +556,9 @@ impl Ord for PgNumeric {
     fn cmp(&self, other: &Self) -> Ordering {
         match (&self.0, &other.0) {
             (Repr::Finite(left), Repr::Finite(right))
-                if left.negative == right.negative && !left.digits.is_empty() =>
+                if left.negative == right.negative
+                    && !left.digits.is_empty()
+                    && !right.digits.is_empty() =>
             {
                 let magnitude = left.cmp_magnitude(right);
                 if left.negative {
