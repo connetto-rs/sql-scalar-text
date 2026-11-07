@@ -1,6 +1,8 @@
 //! Interval arithmetic computed as PostgreSQL 18 computes it, every answer and every refusal's
 //! message measured on the engine.
 
+#[path = "support/answers.rs"]
+mod answers;
 #[path = "support/containers.rs"]
 mod containers;
 #[path = "support/exit_slot.rs"]
@@ -8,13 +10,8 @@ mod exit_slot;
 #[path = "support/postgres.rs"]
 mod postgres;
 
-use std::fmt::Display;
-
-use diesel::{
-    dsl::sql,
-    prelude::*,
-    sql_types::{Array, Text},
-};
+use answers::{Answer, compare, quoted};
+use diesel::{PgConnection, prelude::*};
 use sql_values::{
     InputContext, IntervalSum, PgInterval, PgTimeZone, PgTimestampTz, ShiftError, parse_f64,
     parse_interval, parse_time, parse_timestamp,
@@ -23,9 +20,6 @@ use sql_values::{
 static PG18: postgres::Slot = exit_slot::ExitSlot::new();
 
 const PG18_TAG: &str = "18.6";
-
-/// What PostgreSQL answers for a query of one text value, `None` for SQL `NULL`.
-type Answer = Result<Option<String>, String>;
 
 /// Intervals at every infinity, field bound and sign mix, as PostgreSQL prints them.
 const OPERANDS: &[&str] = &[
@@ -232,84 +226,12 @@ const GROUPS: &[&[&str]] = &[
     ],
 ];
 
-/// A connection whose `pg_temp.answer` runs one query and answers its text, or `ERROR: ` and
-/// the message it raises.
 fn connect() -> PgConnection {
-    let mut conn = postgres::connect(&PG18, PG18_TAG);
-    // Raw SQL, since a function catching each query's error has no DSL form.
-    diesel::sql_query(
-        "CREATE FUNCTION pg_temp.answer(query text) RETURNS text LANGUAGE plpgsql AS $$
-         DECLARE result text;
-         BEGIN
-             EXECUTE query INTO result;
-             RETURN coalesce('VALUE: ' || result, 'NULL');
-         EXCEPTION WHEN OTHERS THEN
-             RETURN 'ERROR: ' || SQLERRM;
-         END $$",
-    )
-    .execute(&mut conn)
-    .expect("create pg_temp.answer");
-    conn
-}
-
-/// PostgreSQL's answer to every query, in one round trip.
-fn answers(conn: &mut PgConnection, queries: &[String]) -> Vec<Answer> {
-    // Raw SQL, since `unnest ... WITH ORDINALITY` and a `pg_temp` function have no DSL form.
-    let texts: Vec<String> = diesel::select(
-        sql::<Array<Text>>("ARRAY(SELECT pg_temp.answer(q) FROM unnest(")
-            .bind::<Array<Text>, _>(queries)
-            .sql(") WITH ORDINALITY AS t(q, n) ORDER BY n)"),
-    )
-    .get_result(conn)
-    .expect("answer the queries");
-    texts
-        .into_iter()
-        .map(|text| {
-            if let Some(value) = text.strip_prefix("VALUE: ") {
-                Ok(Some(value.to_owned()))
-            } else if let Some(message) = text.strip_prefix("ERROR: ") {
-                Err(message.to_owned())
-            } else {
-                Ok(None)
-            }
-        })
-        .collect()
-}
-
-/// `text` quoted as an SQL string literal.
-fn quoted(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+    answers::connect(&PG18, PG18_TAG)
 }
 
 fn interval(text: &str) -> PgInterval {
     parse_interval(text).unwrap_or_else(|error| panic!("{text:?}: {error}"))
-}
-
-/// The crate's answer in PostgreSQL's words, its value printed or its error's message.
-fn worded<T: Display, E: Display>(result: Result<T, E>) -> Answer {
-    result
-        .map(|value| Some(value.to_string()))
-        .map_err(|error| error.to_string())
-}
-
-/// PostgreSQL's answer as it reads, for values compared by their printed text.
-fn as_printed(answer: Answer) -> Answer {
-    answer
-}
-
-/// Every query against the crate's answer for it, PostgreSQL's answer read through `read`,
-/// listing the disagreements.
-fn compare(conn: &mut PgConnection, cases: Vec<(String, Answer)>, read: fn(Answer) -> Answer) {
-    let (queries, got): (Vec<String>, Vec<Answer>) = cases.into_iter().unzip();
-    let expected = answers(conn, &queries).into_iter().map(read);
-    let mismatches: Vec<String> = queries
-        .iter()
-        .zip(got)
-        .zip(expected)
-        .filter(|((_, got), expected)| got != expected)
-        .map(|((query, got), expected)| format!("{query}: crate {got:?}, PostgreSQL {expected:?}"))
-        .collect();
-    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]
@@ -319,7 +241,7 @@ fn pg18_adds_subtracts_and_negates_every_pair() {
     for &left in OPERANDS {
         cases.push((
             format!("SELECT (-{}::interval)::text", quoted(left)),
-            worded(interval(left).checked_neg()),
+            Answer::of(interval(left).checked_neg()),
         ));
         for &right in OPERANDS {
             for (operator, result) in [
@@ -332,12 +254,12 @@ fn pg18_adds_subtracts_and_negates_every_pair() {
                         quoted(left),
                         quoted(right)
                     ),
-                    worded(result),
+                    Answer::of(result),
                 ));
             }
         }
     }
-    compare(&mut conn, cases, as_printed);
+    compare(&mut conn, cases);
 }
 
 #[test]
@@ -357,12 +279,12 @@ fn pg18_multiplies_and_divides_by_every_factor() {
                         quoted(span),
                         quoted(factor)
                     ),
-                    worded(result),
+                    Answer::of(result),
                 ));
             }
         }
     }
-    compare(&mut conn, cases, as_printed);
+    compare(&mut conn, cases);
 }
 
 #[test]
@@ -382,12 +304,12 @@ fn pg18_shifts_every_timestamp() {
                         quoted(at),
                         quoted(span)
                     ),
-                    worded(result),
+                    Answer::of(result),
                 ));
             }
         }
     }
-    compare(&mut conn, cases, as_printed);
+    compare(&mut conn, cases);
 }
 
 #[test]
@@ -406,11 +328,11 @@ fn pg18_subtracts_every_pair_of_timestamps() {
                     quoted(later),
                     quoted(earlier)
                 ),
-                worded(difference),
+                Answer::of(difference),
             ));
         }
     }
-    compare(&mut conn, cases, as_printed);
+    compare(&mut conn, cases);
 }
 
 #[test]
@@ -430,12 +352,12 @@ fn pg18_shifts_every_time() {
                         quoted(at),
                         quoted(span)
                     ),
-                    worded(result),
+                    Answer::of(result),
                 ));
             }
         }
     }
-    compare(&mut conn, cases, as_printed);
+    compare(&mut conn, cases);
 }
 
 /// `timestamptz ± interval` under each zone as the session's `TimeZone`, the result printed at
@@ -468,8 +390,8 @@ fn pg18_shifts_every_timestamptz_in_each_zone() {
                     ),
                 ] {
                     let printed = match result {
-                        Ok(shifted) => worded(shifted.to_timestamp(&utc)),
-                        Err(error) => Err(error.to_string()),
+                        Ok(shifted) => Answer::of(shifted.to_timestamp(&utc)),
+                        Err(error) => Answer::Error(error.to_string()),
                     };
                     cases.push((
                         format!(
@@ -482,7 +404,7 @@ fn pg18_shifts_every_timestamptz_in_each_zone() {
                 }
             }
         }
-        compare(&mut conn, cases, as_printed);
+        compare(&mut conn, cases);
     }
 }
 
@@ -553,12 +475,16 @@ fn pg18_sums_and_averages_every_group() {
             ("sum", churned.sum()),
             ("avg", churned.avg()),
         ] {
+            let answer = match got {
+                Ok(Some(value)) => Answer::Value(value.to_string()),
+                Ok(None) => Answer::Null,
+                Err(error) => Answer::Error(error.to_string()),
+            };
             cases.push((
                 format!("SELECT {aggregate}(x)::text FROM unnest({array}) AS x"),
-                got.map(|value| value.map(|value| value.to_string()))
-                    .map_err(|error| error.to_string()),
+                answer,
             ));
         }
     }
-    compare(&mut conn, cases, as_printed);
+    compare(&mut conn, cases);
 }

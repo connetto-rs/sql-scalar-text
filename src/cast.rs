@@ -6,7 +6,7 @@ use core::fmt;
 
 use crate::{
     datetime::{DateTimeError, InputContext, PgDate, PgTimestamp, PgTimestampTz},
-    numeric::{NumericTypmod, PgNumeric},
+    numeric::{NumericError, NumericTypmod, PgNumeric},
 };
 
 /// A literal as written before `::`, its quotes and escapes already decoded.
@@ -331,10 +331,10 @@ impl Constant {
                 } else if let Ok(value) = int_in(text, 64) {
                     Ok(Self::Bigint(value))
                 } else {
-                    PgNumeric::parse(text).map(Self::Numeric)
+                    numeric_input(text).map(Self::Numeric)
                 }
             }
-            Some(NumberToken::Decimal) => PgNumeric::parse(text).map(Self::Numeric),
+            Some(NumberToken::Decimal) => numeric_input(text).map(Self::Numeric),
         }
     }
 
@@ -462,8 +462,8 @@ fn cast_constant(constant: Constant, target: CastTarget) -> Result<CastValue, Ca
             .ok_or(CastError::OutOfRange(PgType::Bigint)),
         CastTarget::Numeric(typmod) => {
             let value = match constant {
-                Constant::Integer(value) => PgNumeric::from_i64(i64::from(value)),
-                Constant::Bigint(value) => PgNumeric::from_i64(value),
+                Constant::Integer(value) => PgNumeric::from(value),
+                Constant::Bigint(value) => PgNumeric::from(value),
                 Constant::Numeric(value) => value,
             };
             numeric_typmod(value, typmod)
@@ -501,7 +501,7 @@ fn cast_quoted(text: &str, target: CastTarget) -> Result<CastValue, CastError> {
             int_input(text, 32, PgType::Integer).map(|v| CastValue::Integer(narrow(v)))
         }
         CastTarget::Bigint => int_input(text, 64, PgType::Bigint).map(CastValue::Bigint),
-        CastTarget::Numeric(typmod) => numeric_typmod(PgNumeric::parse(text)?, typmod),
+        CastTarget::Numeric(typmod) => numeric_typmod(numeric_input(text)?, typmod),
         CastTarget::Text | CastTarget::Varchar(_) | CastTarget::Bpchar(_) => {
             Ok(character(text, target))
         }
@@ -532,6 +532,15 @@ fn numeric_typmod(value: PgNumeric, typmod: Option<NumericTypmod>) -> Result<Cas
         None => Ok(value),
     }
     .map(CastValue::Numeric)
+}
+
+/// `numeric_in`, its refusal as the cast error.
+fn numeric_input(text: &str) -> Result<PgNumeric, CastError> {
+    PgNumeric::parse(text).map_err(|error| match error {
+        NumericError::InvalidInputSyntax => CastError::InvalidInputSyntax(PgType::Numeric),
+        NumericError::FormatOverflow => CastError::NumericFormatOverflow,
+        NumericError::DivisionByZero => unreachable!("numeric_in never divides"),
+    })
 }
 
 /// The `varchar()` or `bpchar()` length coercion of an explicit cast, which truncates to the
